@@ -25,6 +25,7 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/text/unicode/runenames"
@@ -233,6 +234,22 @@ func hover(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, rng pr
 	pattern, embedRng := parseEmbedDirective(pgf.Mapper, rng)
 	if pattern != "" {
 		return hoverEmbed(fh, embedRng, pattern)
+	}
+
+	// MyGO: hover over decorators (e.g. "@logger", "@repeat(3)", "@pkg.Decor").
+	//
+	// Decorator syntax is not represented in standard Go AST nodes, so the
+	// normal object resolution below may not find anything. Do a lightweight
+	// lexical probe before falling back to AST-based hover.
+	if decoRng, obj := mygoDecoratorObjectAt(pkg, pgf, rng); obj != nil {
+		qual := typesinternal.FileQualifier(pgf.File, pkg.Types())
+		h, err := hoverObjectLexical(ctx, snapshot, pkg, pgf, obj, qual)
+		if err != nil {
+			return protocol.Range{}, nil, err
+		}
+		if h != nil {
+			return decoRng, h, nil
+		}
 	}
 
 	// hoverRange is the range reported to the client (e.g. for highlighting).
@@ -791,6 +808,205 @@ func hover(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, rng pr
 		promotedFields:    fields,
 		footer:            footer,
 	}, nil
+}
+
+// mygoDecoratorObjectAt returns the (range, object) for a decorator reference at
+// the given hover range, or (zero, nil) if the selection is not within a
+// decorator marker.
+//
+// Supported forms (line-start only, allowing indentation):
+//   @decorator
+//   @decorator(...)
+//   @pkg.Decorator
+//   @pkg.Decorator(...)
+//
+// The returned range highlights the decorator name (not including '@').
+func mygoDecoratorObjectAt(pkg *cache.Package, pgf *parsego.File, rng protocol.Range) (protocol.Range, types.Object) {
+	startOff, endOff, err := pgf.Mapper.RangeOffsets(rng)
+	if err != nil {
+		return protocol.Range{}, nil
+	}
+	off := startOff
+	if endOff > off {
+		// In case clients send a non-empty range, use the start.
+		off = startOff
+	}
+	content := pgf.Mapper.Content
+	nameStart, nameEnd, base, name, ok := scanDecoratorAtOffset(content, off)
+	if !ok {
+		return protocol.Range{}, nil
+	}
+
+	// Compute highlight range.
+	highlight, err := pgf.PosRange(pgf.Tok.Pos(nameStart), pgf.Tok.Pos(nameEnd))
+	if err != nil {
+		return protocol.Range{}, nil
+	}
+
+	// Resolve object.
+	if base == "" {
+		if obj := pkg.Types().Scope().Lookup(name); obj != nil {
+			return highlight, obj
+		}
+		return protocol.Range{}, nil
+	}
+
+	// Selector form: resolve base as an imported package name.
+	var imported *types.Package
+	for _, spec := range pgf.File.Imports {
+		pkgName := pkg.TypesInfo().PkgNameOf(spec)
+		if pkgName == nil || pkgName.Imported() == nil {
+			continue
+		}
+		local := pkgName.Name()
+		if local == base {
+			imported = pkgName.Imported()
+			break
+		}
+	}
+	if imported == nil {
+		return protocol.Range{}, nil
+	}
+	if obj := imported.Scope().Lookup(name); obj != nil {
+		return highlight, obj
+	}
+	return protocol.Range{}, nil
+}
+
+// hoverObjectLexical is a minimal hover builder for objects discovered via
+// lexical heuristics (e.g. MyGO decorators).
+//
+// It intentionally avoids complex AST-dependent enrichments (inferred
+// signatures, promoted fields, size/offset info, etc), but uses the same
+// doc-comment selection logic as the main hover path.
+func hoverObjectLexical(ctx context.Context, snapshot *cache.Snapshot, originPkg *cache.Package, originPGF *parsego.File, obj types.Object, qual types.Qualifier) (*hoverResult, error) {
+	if obj == nil {
+		return nil, nil
+	}
+	if isBuiltin(obj) {
+		return hoverBuiltin(ctx, snapshot, obj)
+	}
+
+	declPkg, declPGF, declPos, err := NarrowestDeclaringPackage(ctx, snapshot, originPkg, obj)
+	if err != nil {
+		return nil, err
+	}
+
+	decl, spec, field := findDeclInfo([]*ast.File{declPGF.File}, declPos) // may be nil^3
+	var docText string
+	if docComment := chooseDocComment(decl, spec, field); docComment != nil {
+		// Keep it simple: text form. (Main hover path may add doc links.)
+		docText = docComment.Text()
+	}
+
+	signature := types.ObjectString(obj, qual)
+	// For some objects (notably aliases / type names), objectString provides a
+	// better signature, but it requires AST context. Fall back to types.ObjectString
+	// which is always safe for lexically resolved objects.
+	_ = declPkg
+	_ = spec
+
+	return &hoverResult{
+		Synopsis:          doc.Synopsis(docText),
+		FullDocumentation: docText,
+		Signature:         signature,
+		SingleLine:        signature,
+		SymbolName:        obj.Name(),
+	}, nil
+}
+
+// scanDecoratorAtOffset reports whether off is within a decorator marker, and
+// if so returns:
+//   - [nameStart, nameEnd): byte offsets covering the decorator name (excluding '@')
+//   - base: optional selector base ("pkg" in "@pkg.Decor")
+//   - name: decorator identifier ("Decor" in "@pkg.Decor", "repeat" in "@repeat(3)")
+func scanDecoratorAtOffset(src []byte, off int) (nameStart, nameEnd int, base, name string, ok bool) {
+	if off < 0 || off > len(src) {
+		return 0, 0, "", "", false
+	}
+
+	// Find start of line.
+	ls := off
+	for ls > 0 && src[ls-1] != '\n' && src[ls-1] != '\r' {
+		ls--
+	}
+	// Skip indentation.
+	i := ls
+	for i < len(src) && (src[i] == ' ' || src[i] == '\t') {
+		i++
+	}
+	if i >= len(src) || src[i] != '@' {
+		return 0, 0, "", "", false
+	}
+	at := i
+
+	// Only trigger when hovering on '@' or within the decorator name token(s).
+	// We'll compute [nameStart,nameEnd) and verify off ∈ [at,nameEnd).
+
+	// Skip '@' and optional spaces.
+	i++
+	for i < len(src) && (src[i] == ' ' || src[i] == '\t') {
+		i++
+	}
+	firstStart := i
+	id1, id1End := scanGoIdent(src, i)
+	if id1 == "" {
+		return 0, 0, "", "", false
+	}
+	i = id1End
+
+	// Optional selector ".Ident".
+	id2 := ""
+	id2End := i
+	if i < len(src) && src[i] == '.' {
+		i++
+		id2, id2End = scanGoIdent(src, i)
+		if id2 == "" {
+			return 0, 0, "", "", false
+		}
+		i = id2End
+	}
+
+	// Name span excludes '@' but includes selector if present.
+	nameStart = firstStart
+	nameEnd = i
+
+	// Confirm hover offset is within the decorator marker span.
+	if off < at || off >= nameEnd {
+		return 0, 0, "", "", false
+	}
+
+	if id2 != "" {
+		return nameStart, nameEnd, id1, id2, true
+	}
+	return nameStart, nameEnd, "", id1, true
+}
+
+func scanGoIdent(src []byte, off int) (ident string, end int) {
+	if off < 0 || off >= len(src) {
+		return "", off
+	}
+	i := off
+	r, n := utf8.DecodeRune(src[i:])
+	if r == utf8.RuneError && n == 1 {
+		return "", off
+	}
+	if !(r == '_' || unicode.IsLetter(r)) {
+		return "", off
+	}
+	i += n
+	for i < len(src) {
+		r, n = utf8.DecodeRune(src[i:])
+		if r == utf8.RuneError && n == 1 {
+			break
+		}
+		if r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r) {
+			i += n
+			continue
+		}
+		break
+	}
+	return string(src[off:i]), i
 }
 
 // typeDeclContent returns a well formatted type definition.

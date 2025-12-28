@@ -17,6 +17,7 @@ enum Shape {
 func f(x any) {
     _ = x?.y
     _ = x?:y
+    _ = @notdecor
     match x { }
 }
 `)
@@ -56,6 +57,10 @@ func f(x any) {
 	// Decorator name should be macro-styled.
 	if !hasTypedText(mapper, got, "macro", "decorator") {
 		t.Fatalf("expected macro token for decorator name %q", "decorator")
+	}
+	// But inline "@notdecor" should NOT be treated as a decorator.
+	if hasTypedText(mapper, got, "macro", "notdecor") {
+		t.Fatalf("did not expect macro token for inline decorator-like text %q", "notdecor")
 	}
 }
 

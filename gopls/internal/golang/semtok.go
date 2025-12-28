@@ -160,7 +160,7 @@ func lexicalSemanticTokens(uri protocol.DocumentURI, content []byte, rng *protoc
 		}
 		// Highlight MyGO operators (and other punctuation) as operator.
 		switch tok {
-		case token.OPTIONAL_DOT, token.QUESTION, token.COLON, token.AT:
+		case token.OPTIONAL_DOT, token.QUESTION, token.COLON:
 			return semtok.TokOperator, true
 		}
 		// For lexical fallback, keep operator highlighting conservative:
@@ -205,6 +205,30 @@ func lexicalSemanticTokens(uri protocol.DocumentURI, content []byte, rng *protoc
 	pendingQOff := 0
 	// Pending '@' that decorates the immediately following identifier.
 	pendingDecorator := false
+	pendingDecoratorLineStart := false
+	// Helper: whether offset is at the start of a line, ignoring leading spaces/tabs.
+	isLineStartAfterIndent := func(off int) bool {
+		if off <= 0 {
+			return off == 0
+		}
+		if off > len(content) {
+			return false
+		}
+		// Find previous newline (or BOF), then require only indent whitespace up to off.
+		i := off - 1
+		for i >= 0 && content[i] != '\n' && content[i] != '\r' {
+			i--
+		}
+		j := i + 1
+		for j < off {
+			if content[j] == ' ' || content[j] == '\t' {
+				j++
+				continue
+			}
+			return false
+		}
+		return true
+	}
 
 	for {
 		pos, tok, lit := s.Scan()
@@ -218,6 +242,7 @@ func lexicalSemanticTokens(uri protocol.DocumentURI, content []byte, rng *protoc
 		// Ignore auto-inserted semicolons: they don't exist in the buffer.
 		if tok == token.SEMICOLON && lit == "\n" {
 			pendingDecorator = false
+			pendingDecoratorLineStart = false
 			continue
 		}
 
@@ -240,17 +265,23 @@ func lexicalSemanticTokens(uri protocol.DocumentURI, content []byte, rng *protoc
 
 		// Decorator: "@decorator" -> emit '@' as operator and the following IDENT as macro.
 		if tok == token.AT {
-			emit(off, 1, semtok.TokOperator)
-			pendingDecorator = true
+			// "Standard" decorator syntax: only treat '@' as decorator marker when it
+			// appears at the start of a (possibly indented) line.
+			pendingDecoratorLineStart = isLineStartAfterIndent(off)
+			if pendingDecoratorLineStart {
+				emit(off, 1, semtok.TokOperator)
+				pendingDecorator = true
+			}
 			continue
 		}
 		if pendingDecorator {
 			// Be conservative: only the immediately following identifier is treated as decorator name.
-			if tok == token.IDENT && lit != "" {
+			if pendingDecoratorLineStart && tok == token.IDENT && lit != "" {
 				emit(off, len(lit), semtok.TokMacro)
 			}
 			// Clear even if it wasn't an IDENT to avoid leaking state.
 			pendingDecorator = false
+			pendingDecoratorLineStart = false
 		}
 
 		if off < startOff || off >= endOff {
