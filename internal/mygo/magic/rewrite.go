@@ -49,6 +49,7 @@ func Rewrite(files []*ast.File, pkg *types.Package, info *types.Info) {
 		rewriteCompoundAssign(f)
 		rewriteIncDec(f, pkg, info, methodIdx, inferred)
 		rewriteIndexing(f, pkg, info)
+		rewriteChanOps(f, pkg, info)
 		rewriteOperators(f, pkg, info, methodIdx, inferred)
 		rewriteOverloadedMethodCalls(f, pkg, info)
 		// Cleanup tooling-injected imports that ended up unused after rewriting.
@@ -929,6 +930,10 @@ func canSynthesizeMethod(native types.Type, name string, sig *types.Signature) b
 		}
 	case *types.Chan:
 		switch name {
+		case "_send":
+			return true
+		case "_recv":
+			return true
 		case "_init":
 			return true
 		default:
@@ -1528,6 +1533,38 @@ func synthMethodDecl(wrapperName string, native types.Type, name string, reqSig 
 
 	case *types.Chan:
 		switch name {
+		case "_send":
+			// Canonical: _send(Elem)
+			paramV := &ast.Field{
+				Names: []*ast.Ident{{NamePos: pos, Name: "v"}},
+				Type:  typeExprForNative(u.Elem()),
+			}
+			send := &ast.SendStmt{
+				Arrow: pos,
+				Chan:  castX(),
+				Value: &ast.Ident{NamePos: pos, Name: "v"},
+			}
+			return &ast.FuncDecl{
+				Name: &ast.Ident{NamePos: pos, Name: "_send"},
+				Recv: recv,
+				Type: &ast.FuncType{Params: &ast.FieldList{List: []*ast.Field{paramV}}},
+				Body: &ast.BlockStmt{List: []ast.Stmt{send}},
+			}
+		case "_recv":
+			// Canonical: _recv() Elem
+			resT := typeExprForNative(u.Elem())
+			recvExpr := &ast.UnaryExpr{OpPos: pos, Op: token.ARROW, X: castX()}
+			return &ast.FuncDecl{
+				Name: &ast.Ident{NamePos: pos, Name: "_recv"},
+				Recv: recv,
+				Type: &ast.FuncType{
+					Params:  &ast.FieldList{},
+					Results: &ast.FieldList{List: []*ast.Field{{Type: resT}}},
+				},
+				Body: &ast.BlockStmt{List: []ast.Stmt{
+					&ast.ReturnStmt{Results: []ast.Expr{recvExpr}},
+				}},
+			}
 		case "_init":
 			// Support both _init() and _init(int) based on required signature.
 			nargs := 0
@@ -1554,6 +1591,69 @@ func synthMethodDecl(wrapperName string, native types.Type, name string, reqSig 
 	}
 	_ = recvPtr
 	return nil
+}
+
+func rewriteChanOps(file *ast.File, pkg *types.Package, info *types.Info) {
+	goastutil.Apply(file, func(c *goastutil.Cursor) bool {
+		// Helper: if recvT is a type parameter and its constraint interface contains
+		// a method with the given name and arity, allow the rewrite.
+		hasConstraintMethod := func(recvT types.Type, name string, arity int) bool {
+			tp, _ := recvT.(*types.TypeParam)
+			if tp == nil {
+				return false
+			}
+			iface, _ := tp.Constraint().Underlying().(*types.Interface)
+			if iface == nil {
+				return false
+			}
+			for i := 0; i < iface.NumMethods(); i++ {
+				m := iface.Method(i)
+				if m == nil || m.Name() != name {
+					continue
+				}
+				sig, _ := m.Type().(*types.Signature)
+				if sig != nil && sig.Params() != nil && sig.Params().Len() == arity {
+					return true
+				}
+			}
+			return false
+		}
+
+		switch n := c.Node().(type) {
+		case *ast.SendStmt:
+			// ch <- v  ==>  ch._send(v) (if _send exists / constraint allows)
+			recvT := typeOfExpr(info, n.Chan)
+			args := []ast.Expr{n.Value}
+			name, ok := chooseMagicMethodName(recvT, pkg, info, "_send", args)
+			if !ok {
+				if !hasConstraintMethod(recvT, "_send", 1) {
+					return true
+				}
+				name, ok = "_send", true
+			}
+			call := makeMethodCall(n.Chan, name, args)
+			c.Replace(&ast.ExprStmt{X: call})
+			return false
+
+		case *ast.UnaryExpr:
+			// <-ch  ==>  ch._recv() (if _recv exists / constraint allows)
+			if n.Op != token.ARROW {
+				return true
+			}
+			recvT := typeOfExpr(info, n.X)
+			name, ok := chooseMagicMethodName(recvT, pkg, info, "_recv", nil)
+			if !ok {
+				if !hasConstraintMethod(recvT, "_recv", 0) {
+					return true
+				}
+				name, ok = "_recv", true
+			}
+			call := makeMethodCall(n.X, name, nil)
+			c.Replace(call)
+			return false
+		}
+		return true
+	}, nil)
 }
 
 func injectPtrInitWrapperDecl(file *ast.File, wrapperName string, orig types.Type, initSig *types.Signature) {
