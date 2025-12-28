@@ -37,8 +37,12 @@ import (
 	"golang.org/x/tools/gopls/internal/util/moremaps"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/gopls/internal/util/tokeninternal"
+	internalastutil "golang.org/x/tools/internal/astutil"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/gcimporter"
+	mygodefaults "golang.org/x/tools/internal/mygo/defaults"
+	mygoenum "golang.org/x/tools/internal/mygo/enum"
+	mygotypecheck "golang.org/x/tools/internal/mygo/typecheck"
 	"golang.org/x/tools/internal/packagesinternal"
 	"golang.org/x/tools/internal/typesinternal"
 	"golang.org/x/tools/internal/versions"
@@ -1634,6 +1638,120 @@ func (b *typeCheckBatch) checkPackage(ctx context.Context, fset *token.FileSet, 
 			pkg.typeErrors = append(pkg.typeErrors, e.(types.Error))
 		}
 		cfg := b.typesConfig(ctx, inputs, imports, onError)
+
+		// --- MyGO typecheck pipeline refactor ---
+		//
+		// If MyGO-only nodes are present, clone parsego files to avoid mutating
+		// the shared parse cache, then:
+		//  1) placeholder MyGO nodes (so go/types can run),
+		//  2) type-check placeholders with a temporary info/package,
+		//  3) expand placeholders into standard Go AST using that info,
+		//  4) run the real typecheck.
+		needMyGO := false
+		var origFiles []*ast.File
+		for _, cgf := range pkg.compiledGoFiles {
+			origFiles = append(origFiles, cgf.File)
+			if mygotypecheck.NeedsRewrite(cgf.File) {
+				needMyGO = true
+			}
+		}
+		enumIdx := mygoenum.BuildIndex(origFiles)
+		needRewrite := needMyGO || enumIdx.HasAny()
+		if needRewrite {
+			clonePGF := func(pgf *parsego.File) *parsego.File {
+				return &parsego.File{
+					URI:      pgf.URI,
+					Mode:     pgf.Mode,
+					File:     internalastutil.CloneNode(pgf.File),
+					Tok:      pgf.Tok,
+					Src:      pgf.Src,
+					Mapper:   pgf.Mapper,
+					ParseErr: pgf.ParseErr,
+				}
+			}
+			clonePGFs := func(in []*parsego.File) []*parsego.File {
+				out := make([]*parsego.File, len(in))
+				for i, pgf := range in {
+					out[i] = clonePGF(pgf)
+				}
+				return out
+			}
+			pkg.goFiles = clonePGFs(pkg.goFiles)
+			pkg.compiledGoFiles = clonePGFs(pkg.compiledGoFiles)
+
+			// Prepare placeholders and collect file list.
+			var files []*ast.File
+			for _, cgf := range pkg.compiledGoFiles {
+				files = append(files, cgf.File)
+			}
+
+			// Enum rewrite: constructor selectors + switch/case patterns.
+			// Recompute index on cloned files (so we see generated decls from FixSrc).
+			enumIdx2 := mygoenum.BuildIndex(files)
+			if enumIdx2.HasAny() {
+				mygoenum.RewriteFiles(files, enumIdx2)
+			}
+
+			// Temporary typecheck for:
+			// - resolving default-arg metadata targets (methods, pkg-qualified funcs),
+			// - driving OptionalChainExpr / TernaryExpr expansion.
+			//
+			// We may run it twice if default-arg rewriting changes the AST and we also
+			// need MyGO expr expansion.
+			tmpCfg := b.typesConfig(ctx, inputs, imports, func(e error) {})
+
+			runTmp := func() (*types.Package, *types.Info) {
+				tmpPkg := types.NewPackage(string(inputs.pkgPath), string(inputs.name))
+				tmpInfo := &types.Info{
+					Types:      make(map[ast.Expr]types.TypeAndValue),
+					Defs:       make(map[*ast.Ident]types.Object),
+					Uses:       make(map[*ast.Ident]types.Object),
+					Implicits:  make(map[ast.Node]types.Object),
+					Instances:  make(map[*ast.Ident]types.Instance),
+					Selections: make(map[*ast.SelectorExpr]*types.Selection),
+					Scopes:     make(map[ast.Node]*types.Scope),
+				}
+				_ = types.NewChecker(tmpCfg, pkg.fset, tmpPkg, tmpInfo).Files(files)
+				return tmpPkg, tmpInfo
+			}
+
+			// First temp pass: resolve call targets for default-arg filling.
+			tmpPkg1, tmpInfo1 := runTmp()
+
+			// Cross-package defaults: best-effort by reading dependency source and
+			// indexing exported top-level functions with defaults metadata.
+			foreignDefaults := make(map[string]mygodefaults.Info)
+			for _, depID := range inputs.depsByImpPath {
+				depPH := b.getHandle(depID)
+				if depPH == nil || depPH.localInputs == nil {
+					continue
+				}
+				depParsed, err := b.parseCache.parseFiles(ctx, pkg.fset, parsego.Full, false, depPH.localInputs.compiledGoFiles...)
+				if err != nil {
+					continue
+				}
+				var depFiles []*ast.File
+				for _, pgf := range depParsed {
+					depFiles = append(depFiles, pgf.File)
+				}
+				for k, v := range mygodefaults.BuildExportedFuncIndex(string(depPH.mp.PkgPath), depFiles) {
+					foreignDefaults[k] = v
+				}
+				for k, v := range mygodefaults.BuildExportedMethodIndex(string(depPH.mp.PkgPath), depFiles) {
+					foreignDefaults[k] = v
+				}
+			}
+
+			mygodefaults.RewriteCallsWithTypesAndForeign(files, tmpPkg1, tmpInfo1, foreignDefaults)
+
+			// Second temp pass (only if needed): OptionalChain/Ternary expansion needs
+			// types that reflect filled default args.
+			if needMyGO {
+				tmpPkg2, tmpInfo2 := runTmp()
+				mygotypecheck.RewriteInPlace(files, tmpInfo2, tmpPkg2)
+			}
+		}
+
 		check := types.NewChecker(cfg, pkg.fset, pkg.types, pkg.typesInfo)
 
 		var files []*ast.File
@@ -1712,6 +1830,9 @@ func (b *typeCheckBatch) checkPackage(ctx context.Context, fset *token.FileSet, 
 			pkg.diagnostics = append(pkg.diagnostics, diag)
 		}
 	}
+
+	// MyGO: enum exhaustiveness diagnostics (best-effort).
+	addMyGOEnumExhaustiveDiagnostics(pkg)
 
 	return &Package{ph.mp, ph.loadDiagnostics, pkg}, nil
 }

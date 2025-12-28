@@ -29,6 +29,8 @@ import (
 	"golang.org/x/tools/internal/astutil"
 	"golang.org/x/tools/internal/diff"
 	"golang.org/x/tools/internal/event"
+	mygodefaults "golang.org/x/tools/internal/mygo/defaults"
+	mygoenum "golang.org/x/tools/internal/mygo/enum"
 )
 
 // Common parse modes; these should be reused wherever possible to increase
@@ -54,6 +56,23 @@ func Parse(ctx context.Context, fset *token.FileSet, uri protocol.DocumentURI, s
 	ctx, done := event.Start(ctx, "cache.ParseGoSrc", label.File.Of(uri.Path()))
 	defer done()
 
+	// MyGO: rewrite enum declarations into parseable Go before go/parser runs.
+	// This is a source-level transform (not an AST transform) because `enum` is
+	// not a Go token and therefore can't be parsed by go/parser.
+	enumFixed := false
+	if newSrc, ok := mygoenum.FixSrc(uri.Path(), src); ok {
+		src = newSrc
+		enumFixed = true
+	}
+	if newSrc, ok := mygoenum.FixPatternSrc(uri.Path(), src); ok {
+		src = newSrc
+		enumFixed = true
+	}
+	if newSrc, ok := mygodefaults.FixSrc(uri.Path(), src); ok {
+		src = newSrc
+		enumFixed = true
+	}
+
 	file, err := parser.ParseFile(fset, uri.Path(), src, mode)
 	var parseErr scanner.ErrorList
 	if err != nil {
@@ -68,7 +87,7 @@ func Parse(ctx context.Context, fset *token.FileSet, uri protocol.DocumentURI, s
 
 	tok := tokenFile(file)
 
-	fixedSrc := false
+	fixedSrc := enumFixed
 	fixedAST := false
 	// If there were parse errors, attempt to fix them up.
 	if parseErr != nil {
