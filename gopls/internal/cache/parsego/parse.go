@@ -31,6 +31,7 @@ import (
 	"golang.org/x/tools/internal/event"
 	mygodefaults "golang.org/x/tools/internal/mygo/defaults"
 	mygoenum "golang.org/x/tools/internal/mygo/enum"
+	mygomagic "golang.org/x/tools/internal/mygo/magic"
 )
 
 // Common parse modes; these should be reused wherever possible to increase
@@ -69,6 +70,10 @@ func Parse(ctx context.Context, fset *token.FileSet, uri protocol.DocumentURI, s
 		enumFixed = true
 	}
 	if newSrc, ok := mygodefaults.FixSrc(uri.Path(), src); ok {
+		src = newSrc
+		enumFixed = true
+	}
+	if newSrc, ok := mygomagic.FixSrc(uri.Path(), src); ok {
 		src = newSrc
 		enumFixed = true
 	}

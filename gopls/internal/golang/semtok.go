@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/scanner"
 	"go/token"
 	"go/types"
 	"log"
@@ -41,9 +42,23 @@ import (
 const semDebug = false
 
 func SemanticTokens(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, rng *protocol.Range) (*protocol.SemanticTokens, error) {
+	orig, err := fh.Content()
+	if err != nil {
+		return nil, err
+	}
+
 	pkg, pgf, err := NarrowestPackageForFile(ctx, snapshot, fh.URI())
 	if err != nil {
 		return nil, err
+	}
+
+	// MyGO note: if pgf.Src differs from the actual file content, positions in the
+	// syntax tree are in the "fixed source" domain and cannot be mapped back to
+	// the user's buffer without an offset map. For now, fall back to a lexical
+	// scan over the original content so that semantic tokens at least align with
+	// the editor buffer.
+	if !bytes.Equal(pgf.Src, orig) {
+		return lexicalSemanticTokens(fh.URI(), orig, rng)
 	}
 
 	// Select range.
@@ -89,6 +104,180 @@ func SemanticTokens(ctx context.Context, snapshot *cache.Snapshot, fh file.Handl
 			snapshot.Options().EnabledSemanticTokenTypes(),
 			snapshot.Options().EnabledSemanticTokenModifiers()),
 		ResultID: time.Now().String(), // for delta requests, but we've never seen any
+	}, nil
+}
+
+func lexicalSemanticTokens(uri protocol.DocumentURI, content []byte, rng *protocol.Range) (*protocol.SemanticTokens, error) {
+	mapper := protocol.NewMapper(uri, content)
+
+	startOff, endOff := 0, len(content)
+	if rng != nil {
+		var err error
+		startOff, endOff, err = mapper.RangeOffsets(*rng)
+		if err != nil {
+			return nil, err
+		}
+		if startOff < 0 {
+			startOff = 0
+		}
+		if endOff > len(content) {
+			endOff = len(content)
+		}
+	}
+
+	fset := token.NewFileSet()
+	tf := fset.AddFile(uri.Path(), -1, len(content))
+	var s scanner.Scanner
+	// We intentionally ignore scanner errors here: even ill-formed code should
+	// return best-effort tokens for editor UX.
+	s.Init(tf, content, func(_ token.Position, _ string) {}, scanner.ScanComments)
+
+	isMyGOKeyword := func(lit string) bool {
+		switch lit {
+		case "enum", "match":
+			return true
+		default:
+			return false
+		}
+	}
+
+	// classify chooses a semantic token type for a scanned token.
+	classify := func(tok token.Token, lit string) (semtok.Type, bool) {
+		switch tok {
+		case token.COMMENT:
+			return semtok.TokComment, true
+		case token.STRING, token.CHAR:
+			return semtok.TokString, true
+		case token.INT, token.FLOAT, token.IMAG:
+			return semtok.TokNumber, true
+		}
+		if tok.IsKeyword() {
+			return semtok.TokKeyword, true
+		}
+		// MyGO-only keywords are scanned as IDENT by Go.
+		if tok == token.IDENT && isMyGOKeyword(lit) {
+			return semtok.TokKeyword, true
+		}
+		// Highlight MyGO operators (and other punctuation) as operator.
+		switch tok {
+		case token.OPTIONAL_DOT, token.QUESTION, token.COLON, token.AT:
+			return semtok.TokOperator, true
+		}
+		// For lexical fallback, keep operator highlighting conservative:
+		// only obvious operator tokens plus a small whitelist above.
+		if tok.IsOperator() {
+			return semtok.TokOperator, true
+		}
+		return "", false
+	}
+
+	var items []semtok.Token
+	emit := func(off int, n int, typ semtok.Type) {
+		if n <= 0 {
+			return
+		}
+		if off < startOff || off >= endOff {
+			return
+		}
+		if off+n > len(content) {
+			n = len(content) - off
+		}
+		if off+n > endOff {
+			n = endOff - off
+		}
+		if n <= 0 {
+			return
+		}
+		p, err := mapper.OffsetPosition(off)
+		if err != nil {
+			return
+		}
+		items = append(items, semtok.Token{
+			Line:  p.Line,
+			Start: p.Character,
+			Len:   uint32(protocol.UTF16Len(content[off : off+n])),
+			Type:  typ,
+		})
+	}
+
+	// Pending '?' that may combine with an immediately following ':' to form '?:'.
+	pendingQ := false
+	pendingQOff := 0
+	// Pending '@' that decorates the immediately following identifier.
+	pendingDecorator := false
+
+	for {
+		pos, tok, lit := s.Scan()
+		if tok == token.EOF {
+			if pendingQ {
+				emit(pendingQOff, 1, semtok.TokOperator)
+				pendingQ = false
+			}
+			break
+		}
+		// Ignore auto-inserted semicolons: they don't exist in the buffer.
+		if tok == token.SEMICOLON && lit == "\n" {
+			pendingDecorator = false
+			continue
+		}
+
+		off := tf.Offset(pos)
+		// Combine contiguous "?:"
+		if tok == token.QUESTION {
+			pendingQ = true
+			pendingQOff = off
+			continue
+		}
+		if tok == token.COLON && pendingQ && off == pendingQOff+1 {
+			emit(pendingQOff, 2, semtok.TokOperator)
+			pendingQ = false
+			continue
+		}
+		if pendingQ {
+			emit(pendingQOff, 1, semtok.TokOperator)
+			pendingQ = false
+		}
+
+		// Decorator: "@decorator" -> emit '@' as operator and the following IDENT as macro.
+		if tok == token.AT {
+			emit(off, 1, semtok.TokOperator)
+			pendingDecorator = true
+			continue
+		}
+		if pendingDecorator {
+			// Be conservative: only the immediately following identifier is treated as decorator name.
+			if tok == token.IDENT && lit != "" {
+				emit(off, len(lit), semtok.TokMacro)
+			}
+			// Clear even if it wasn't an IDENT to avoid leaking state.
+			pendingDecorator = false
+		}
+
+		if off < startOff || off >= endOff {
+			continue
+		}
+
+		typ, ok := classify(tok, lit)
+		if !ok {
+			continue
+		}
+
+		// Determine token length in bytes.
+		var n int
+		if lit != "" {
+			n = len(lit)
+		} else {
+			n = len(tok.String())
+		}
+		if n <= 0 {
+			continue
+		}
+		emit(off, n, typ)
+	}
+
+	return &protocol.SemanticTokens{
+		Data:     semtok.Encode(items, nil, nil),
+		ResultID: time.Now().String(),
 	}, nil
 }
 

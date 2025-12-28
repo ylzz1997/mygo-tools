@@ -42,6 +42,7 @@ import (
 	"golang.org/x/tools/internal/gcimporter"
 	mygodefaults "golang.org/x/tools/internal/mygo/defaults"
 	mygoenum "golang.org/x/tools/internal/mygo/enum"
+	mygomagic "golang.org/x/tools/internal/mygo/magic"
 	mygotypecheck "golang.org/x/tools/internal/mygo/typecheck"
 	"golang.org/x/tools/internal/packagesinternal"
 	"golang.org/x/tools/internal/typesinternal"
@@ -1648,6 +1649,7 @@ func (b *typeCheckBatch) checkPackage(ctx context.Context, fset *token.FileSet, 
 		//  3) expand placeholders into standard Go AST using that info,
 		//  4) run the real typecheck.
 		needMyGO := false
+		needMagic := false
 		var origFiles []*ast.File
 		for _, cgf := range pkg.compiledGoFiles {
 			origFiles = append(origFiles, cgf.File)
@@ -1656,7 +1658,8 @@ func (b *typeCheckBatch) checkPackage(ctx context.Context, fset *token.FileSet, 
 			}
 		}
 		enumIdx := mygoenum.BuildIndex(origFiles)
-		needRewrite := needMyGO || enumIdx.HasAny()
+		needMagic = mygomagic.NeedsRewrite(origFiles)
+		needRewrite := needMyGO || enumIdx.HasAny() || needMagic
 		if needRewrite {
 			clonePGF := func(pgf *parsego.File) *parsego.File {
 				return &parsego.File{
@@ -1692,6 +1695,10 @@ func (b *typeCheckBatch) checkPackage(ctx context.Context, fset *token.FileSet, 
 				mygoenum.RewriteFiles(files, enumIdx2)
 			}
 
+			// Method overloading: rename overloaded method declarations so go/types can run.
+			// Call sites / operators are rewritten later once we have type info.
+			mygomagic.RenameOverloadedMethods(files, pkg.fset)
+
 			// Temporary typecheck for:
 			// - resolving default-arg metadata targets (methods, pkg-qualified funcs),
 			// - driving OptionalChainExpr / TernaryExpr expansion.
@@ -1720,7 +1727,7 @@ func (b *typeCheckBatch) checkPackage(ctx context.Context, fset *token.FileSet, 
 
 			// Cross-package defaults: best-effort by reading dependency source and
 			// indexing exported top-level functions with defaults metadata.
-			foreignDefaults := make(map[string]mygodefaults.Info)
+			foreignDefaults := make(map[string]mygodefaults.ForeignInfo)
 			for _, depID := range inputs.depsByImpPath {
 				depPH := b.getHandle(depID)
 				if depPH == nil || depPH.localInputs == nil {
@@ -1744,11 +1751,18 @@ func (b *typeCheckBatch) checkPackage(ctx context.Context, fset *token.FileSet, 
 
 			mygodefaults.RewriteCallsWithTypesAndForeign(files, tmpPkg1, tmpInfo1, foreignDefaults)
 
-			// Second temp pass (only if needed): OptionalChain/Ternary expansion needs
-			// types that reflect filled default args.
-			if needMyGO {
+			// Second temp pass: after default-arg filling, run magic/operator rewrites
+			// (and then, if needed, MyGO Optional/Ternary/Elvis expansion) using updated types.
+			if needMagic || needMyGO {
 				tmpPkg2, tmpInfo2 := runTmp()
-				mygotypecheck.RewriteInPlace(files, tmpInfo2, tmpPkg2)
+				if needMagic {
+					mygomagic.Rewrite(files, tmpPkg2, tmpInfo2)
+				}
+				if needMyGO {
+					// MyGO expr expansion must run with types that reflect magic rewrites, if any.
+					tmpPkg3, tmpInfo3 := runTmp()
+					mygotypecheck.RewriteInPlace(files, tmpInfo3, tmpPkg3)
+				}
 			}
 		}
 
