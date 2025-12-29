@@ -1189,16 +1189,20 @@ func mygoObjectAtOriginalRange(pkg *cache.Package, pgf *parsego.File, orig []byt
 
 	// Find the best matching identifier on this line whose column span contains col8.
 	var (
-		best     *ast.Ident
-		bestCol  = -1
-		bestLen  = 0
-		bestObj  types.Object
+		best    *ast.Ident
+		bestCol = -1
+		bestLen = 0
+		bestObj types.Object
 	)
 
 	// For MyGO files, we need to handle the case where the source has been transformed
 	// (default parameters removed). We scan the original source to find identifiers
 	// that could match the hover position.
-	if isMyGOFile := bytes.Contains(orig, []byte("//mygo:defaultsjson")); isMyGOFile {
+	//
+	// Note: orig is the *editor* buffer (pre-FixSrc), so it will not contain the
+	// injected metadata markers. Detect MyGO defaults by checking the parsed AST
+	// for injected metadata.
+	if isMyGOFile := mygodefaults.HasAnyMetadata([]*ast.File{pgf.File}); isMyGOFile {
 		// Scan the original source line for Go identifiers
 		lineText := extractLine(orig, line)
 		if lineText != "" {
@@ -1382,10 +1386,11 @@ func findASTIdentByName(file *ast.File, name string) *ast.Ident {
 // decorator marker.
 //
 // Supported forms (line-start only, allowing indentation):
-//   @decorator
-//   @decorator(...)
-//   @pkg.Decorator
-//   @pkg.Decorator(...)
+//
+//	@decorator
+//	@decorator(...)
+//	@pkg.Decorator
+//	@pkg.Decorator(...)
 //
 // The returned range highlights the decorator name (not including '@').
 func mygoDecoratorObjectAt(pkg *cache.Package, pgf *parsego.File, rng protocol.Range) (protocol.Range, types.Object) {
@@ -1470,8 +1475,22 @@ func hoverObjectLexical(ctx context.Context, snapshot *cache.Snapshot, originPkg
 	// For some objects (notably aliases / type names), objectString provides a
 	// better signature, but it requires AST context. Fall back to types.ObjectString
 	// which is always safe for lexically resolved objects.
-	_ = declPkg
 	_ = spec
+
+	// --- MyGO enrichments (minimal, but high-signal) ---
+	// Even in lexical hover mode, preserve MyGO default parameter display so the
+	// user doesn't lose information just because FixSrc rewrote the buffer.
+	var footer string
+	if fn, _ := obj.(*types.Func); fn != nil {
+		if di, ok := mygoDefaultsInfoForObject(declPkg, declPGF, fn); ok {
+			if s, ok := mygoApplyDefaultsToSignature(signature, fn, di); ok {
+				signature = s
+			}
+		}
+	}
+	if extra := mygoHoverExtras(declPkg, declPGF, decl, field, obj); extra != "" {
+		footer = extra
+	}
 
 	return &hoverResult{
 		Synopsis:          doc.Synopsis(docText),
@@ -1479,6 +1498,7 @@ func hoverObjectLexical(ctx context.Context, snapshot *cache.Snapshot, originPkg
 		Signature:         signature,
 		SingleLine:        signature,
 		SymbolName:        obj.Name(),
+		footer:            footer,
 	}, nil
 }
 

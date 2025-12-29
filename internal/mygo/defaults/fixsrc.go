@@ -121,8 +121,11 @@ func FixSrc(filename string, src []byte) (_ []byte, changed bool) {
 		var defs []def
 		required := 0
 
-		// We track the current field's last ident as the parameter name.
+		// Track identifiers within the current parameter field (between top-level commas).
+		// For "name type = expr", the first ident is the parameter name; the last ident
+		// is often the type name (e.g. "string", "int").
 		lastParamName := ""
+		fieldFirstIdent := ""
 		fieldHasDefault := false
 		parenDepth := 1
 		brackDepth := 0
@@ -152,15 +155,15 @@ func FixSrc(filename string, src []byte) (_ []byte, changed bool) {
 						// Extract expr: eqStartOff points to '=', so skip it and trim spaces
 						exprRaw := string(src[eqStartOff:eqEndOff])
 						expr := strings.TrimSpace(strings.TrimPrefix(exprRaw, "="))
-						defs = append(defs, def{param: lastParamName, expr: expr})
+						paramName := fieldFirstIdent
+						if paramName == "" {
+							paramName = lastParamName
+						}
+						defs = append(defs, def{param: paramName, expr: expr})
 						seg := src[eqStartOff:eqEndOff]
 						edits = append(edits, edit{start: eqStartOff, end: eqEndOff, repl: makeWhitespacePreservingNewlines(seg)})
 						fieldHasDefault = true
 					}
-					// If a previous field in this group had a default but this one doesn't...
-					// actually, go/scanner doesn't parse "a, b = 1".
-					// But our simplified scanner treats "a" then "," then "b" then "=".
-					// The logic here is tricky. Let's rely on finding "=" at the top level of parens.
 					if !fieldHasDefault {
 						required++
 					}
@@ -177,7 +180,11 @@ func FixSrc(filename string, src []byte) (_ []byte, changed bool) {
 						// Extract expr: eqStartOff points to '=', so skip it and trim spaces
 						exprRaw := string(src[eqStartOff:eqEndOff])
 						expr := strings.TrimSpace(strings.TrimPrefix(exprRaw, "="))
-						defs = append(defs, def{param: lastParamName, expr: expr})
+						paramName := fieldFirstIdent
+						if paramName == "" {
+							paramName = lastParamName
+						}
+						defs = append(defs, def{param: paramName, expr: expr})
 						seg := src[eqStartOff:eqEndOff]
 						edits = append(edits, edit{start: eqStartOff, end: eqEndOff, repl: makeWhitespacePreservingNewlines(seg)})
 						eqStartOff = 0
@@ -188,23 +195,10 @@ func FixSrc(filename string, src []byte) (_ []byte, changed bool) {
 							required++
 						}
 					}
-					// Prepare for next param
-					fieldHasDefault = false // Reset for next param, but wait...
-					// If we have "a, b int = 1", both a and b have defaults.
-					// But here we're parsing tokens. "a" "," "b" "int" "=" "1".
-					// We only see "=" later.
-					// This logic is simplified and assumes "a int = 1, b string = 2".
-					// It doesn't handle "a, b int = 1" correctly (it would count a as required).
-					// MyGO README says: "supports x int = 1".
-					// It implies standard Go parameter syntax but with optional "= value".
-					// So "a, b int = 1" is probably valid if we support it.
-					// For now, let's assume one param per comma for simplicity or that
-					// defaults are only attached to the type?
-					// Actually, the parser logic above is very "local".
-					// If we see "=", we mark `fieldHasDefault`.
-					// But we only see "=" AFTER the comma for the *current* field?
-					// No, we see comma AFTER the "=".
-					// So if we saw "=", `fieldHasDefault` is true.
+					// Prepare for next field.
+					fieldHasDefault = false
+					fieldFirstIdent = ""
+					lastParamName = ""
 				}
 			case token.ASSIGN: // '='
 				if parenDepth == 1 && brackDepth == 0 {
@@ -215,10 +209,10 @@ func FixSrc(filename string, src []byte) (_ []byte, changed bool) {
 			case token.IDENT:
 				if parenDepth == 1 && brackDepth == 0 && eqStartOff == 0 {
 					// Potential parameter name.
-					// We don't know if it's a name or a type yet.
-					// But the last identifier before a comma or equal or type is the name?
-					// This simple scan is imperfect but should work for "name type = val".
 					lastParamName = l2
+					if fieldFirstIdent == "" {
+						fieldFirstIdent = l2
+					}
 				}
 			}
 		}
