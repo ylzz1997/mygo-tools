@@ -229,7 +229,6 @@ func FixSrc(filename string, src []byte) (_ []byte, changed bool) {
 
 		// Insert metadata comment before 'func' keyword.
 		funcOff := tf.Offset(funcPos)
-		startLine := tf.Position(funcPos).Line
 		var meta strings.Builder
 		{
 			var m Metadata
@@ -255,18 +254,14 @@ func FixSrc(filename string, src []byte) (_ []byte, changed bool) {
 				meta.WriteString("*/")
 			}
 		}
-		_ = startLine // preserved for potential future diagnostics mapping
 
-		// Insert metadata at the end of the line containing the 'func' keyword.
-		// This avoids shifting token columns for the signature itself, and avoids
-		// introducing new lines.
-		lineEnd := bytes.IndexByte(src[funcOff:], '\n')
-		ins := len(src)
-		if lineEnd >= 0 {
-			ins = funcOff + lineEnd
-		}
-		// Prepend a space to keep separation from preceding tokens.
-		edits = append(edits, edit{start: ins, end: ins, repl: append([]byte(" "), []byte(meta.String())...)})
+		// Insert metadata immediately before 'func', without introducing newlines.
+		// This keeps physical line numbers stable (critical for LSP diagnostics).
+		//
+		// Note: this shifts columns on the declaration line only; call sites and
+		// other lines keep identical offsets.
+		repl := append([]byte(meta.String()), ' ')
+		edits = append(edits, edit{start: funcOff, end: funcOff, repl: repl})
 	}
 
 	if len(edits) == 0 {

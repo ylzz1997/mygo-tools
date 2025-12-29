@@ -54,7 +54,7 @@ func trimCommentText(text string) string {
 	// as FixSrc may inject either form.
 	text = strings.TrimSpace(text)
 	if strings.HasPrefix(text, "//") {
-		return strings.TrimSpace(strings.TrimPrefix(text, "//"))
+	return strings.TrimSpace(strings.TrimPrefix(text, "//"))
 	}
 	if strings.HasPrefix(text, "/*") {
 		text = strings.TrimSpace(strings.TrimPrefix(text, "/*"))

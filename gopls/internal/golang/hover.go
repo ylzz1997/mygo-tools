@@ -44,6 +44,8 @@ import (
 	"golang.org/x/tools/gopls/internal/util/tokeninternal"
 	"golang.org/x/tools/internal/astutil"
 	"golang.org/x/tools/internal/event"
+	mygodefaults "golang.org/x/tools/internal/mygo/defaults"
+	mygomagic "golang.org/x/tools/internal/mygo/magic"
 	"golang.org/x/tools/internal/stdlib"
 	"golang.org/x/tools/internal/typeparams"
 	"golang.org/x/tools/internal/typesinternal"
@@ -531,6 +533,18 @@ func hover(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, rng pr
 		}
 	}
 
+	// MyGO: augment function/method signatures with default parameter values so
+	// they show up in clients that only display the signature line.
+	if fn, _ := obj.(*types.Func); fn != nil {
+		if di, ok := mygoDefaultsInfoForObject(declPkg, declPGF, fn); ok {
+			if s, ok := mygoApplyDefaultsToSignature(signature, fn, di); ok {
+				signature = s
+			}
+			// Keep the single-line signature in sync with the updated signature.
+			singleLineSignature = signature
+		}
+	}
+
 	// Compute size information for types,
 	// including allocator size class,
 	// and (size, offset) for struct fields.
@@ -812,6 +826,18 @@ func hover(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, rng pr
 		footer = fmt.Sprintf("Added in %v", sym.Version)
 	}
 
+	// --- MyGO hover enrichments ---
+	// - Default parameters: show defaults on the function/method; when hovering a
+	//   parameter, show its default value (if any).
+	// - Method overloading: show overload candidate method names (best-effort).
+	if extra := mygoHoverExtras(declPkg, declPGF, decl, field, obj); extra != "" {
+		if footer != "" {
+			footer += "\n" + extra
+		} else {
+			footer = extra
+		}
+	}
+
 	return *hoverRange, &hoverResult{
 		Synopsis:          doc.Synopsis(docText),
 		FullDocumentation: docText,
@@ -825,6 +851,282 @@ func hover(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, rng pr
 		promotedFields:    fields,
 		footer:            footer,
 	}, nil
+}
+
+func mygoHoverExtras(declPkg *cache.Package, declPGF *parsego.File, decl ast.Decl, field *ast.Field, obj types.Object) string {
+	if declPkg == nil || declPGF == nil || obj == nil {
+		return ""
+	}
+
+	var parts []string
+
+	// Default parameter info: object-indexed defaults (works for methods too).
+	objIdx := mygodefaults.BuildObjectIndex([]*ast.File{declPGF.File}, declPkg.TypesInfo())
+
+	// Hovering a function/method: show summary of defaults, if any.
+	if fn, _ := obj.(*types.Func); fn != nil {
+		if di, ok := objIdx[fn]; ok && len(di.Names) == len(di.Exprs) && len(di.Names) > 0 {
+			var b strings.Builder
+			b.WriteString("MyGO 默认参数: ")
+			for i := range di.Names {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(di.Names[i])
+				b.WriteString("=")
+				b.WriteString(di.Exprs[i])
+			}
+			parts = append(parts, b.String())
+		}
+
+		// Method overloading: show candidates for the base method name (if this
+		// method looks like a renamed overload).
+		if sig := fn.Signature(); sig != nil && sig.Recv() != nil {
+			if base, ok := mygoBaseMethodName(fn.Name()); ok {
+				if cands := mygoOverloadCandidateNames(sig.Recv().Type(), fn.Pkg(), base); len(cands) > 1 {
+					parts = append(parts, "MyGO 方法重载候选: "+strings.Join(cands, ", "))
+				}
+			}
+		}
+	}
+
+	// Hovering a parameter name: show its default, if any.
+	if v, _ := obj.(*types.Var); v != nil && field != nil {
+		if fd, _ := decl.(*ast.FuncDecl); fd != nil && fd.Name != nil {
+			if fnObj, _ := declPkg.TypesInfo().Defs[fd.Name].(*types.Func); fnObj != nil {
+				if di, ok := objIdx[fnObj]; ok && len(di.Names) == len(di.Exprs) && len(di.Names) > 0 {
+					if expr, ok := mygoDefaultExprForParam(di, v.Name()); ok {
+						parts = append(parts, "MyGO 默认值: "+v.Name()+"="+expr)
+					}
+				}
+			}
+		}
+	}
+
+	return strings.Join(parts, "\n")
+}
+
+func mygoDefaultsInfoForObject(declPkg *cache.Package, declPGF *parsego.File, fn *types.Func) (mygodefaults.Info, bool) {
+	if declPkg == nil || declPGF == nil || fn == nil {
+		return mygodefaults.Info{}, false
+	}
+	objIdx := mygodefaults.BuildObjectIndex([]*ast.File{declPGF.File}, declPkg.TypesInfo())
+	di, ok := objIdx[fn]
+	if !ok || len(di.Names) == 0 || len(di.Names) != len(di.Exprs) {
+		return mygodefaults.Info{}, false
+	}
+	return di, true
+}
+
+func mygoDefaultExprForParam(di mygodefaults.Info, name string) (string, bool) {
+	for i, n := range di.Names {
+		if n == name && i < len(di.Exprs) {
+			return di.Exprs[i], true
+		}
+	}
+	return "", false
+}
+
+func mygoApplyDefaultsToSignature(sig string, fn *types.Func, di mygodefaults.Info) (string, bool) {
+	// Best-effort string rewrite: find the parameter list following the function
+	// name, split it at top-level commas, and append " = <expr>" for params that
+	// have defaults metadata.
+	if sig == "" || fn == nil {
+		return "", false
+	}
+	name := fn.Name()
+	iName := strings.Index(sig, name)
+	if iName < 0 {
+		return "", false
+	}
+	// Find '(' starting the parameter list after the name.
+	openRel := strings.Index(sig[iName+len(name):], "(")
+	if openRel < 0 {
+		return "", false
+	}
+	open := iName + len(name) + openRel
+	close := mygoFindMatchingParen(sig, open)
+	if close < 0 {
+		return "", false
+	}
+	params := sig[open+1 : close]
+
+	parts := mygoSplitTopLevelCommas(params)
+	var outParts []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// Expect "name type" or "a, b type". If there's no space, it's likely
+		// unnamed (e.g. "int"), or a complex type. Leave unchanged.
+		sp := strings.LastIndexByte(p, ' ')
+		if sp <= 0 || sp+1 >= len(p) {
+			outParts = append(outParts, p)
+			continue
+		}
+		namesPart := strings.TrimSpace(p[:sp])
+		typePart := strings.TrimSpace(p[sp+1:])
+		if namesPart == "" || typePart == "" {
+			outParts = append(outParts, p)
+			continue
+		}
+		// namesPart may be "a" or "a, b".
+		names := strings.Split(namesPart, ",")
+		for _, n := range names {
+			n = strings.TrimSpace(n)
+			if n == "" {
+				continue
+			}
+			if expr, ok := mygoDefaultExprForParam(di, n); ok {
+				outParts = append(outParts, n+" "+typePart+" = "+expr)
+			} else {
+				outParts = append(outParts, n+" "+typePart)
+			}
+		}
+	}
+	newParams := strings.Join(outParts, ", ")
+	return sig[:open+1] + newParams + sig[close:], true
+}
+
+func mygoFindMatchingParen(s string, open int) int {
+	if open < 0 || open >= len(s) || s[open] != '(' {
+		return -1
+	}
+	depth := 0
+	brack := 0
+	brc := 0
+	for i := open; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && brack == 0 && brc == 0 {
+				return i
+			}
+		case '[':
+			brack++
+		case ']':
+			if brack > 0 {
+				brack--
+			}
+		case '{':
+			brc++
+		case '}':
+			if brc > 0 {
+				brc--
+			}
+		}
+	}
+	return -1
+}
+
+func mygoSplitTopLevelCommas(s string) []string {
+	var out []string
+	start := 0
+	depth := 0
+	brack := 0
+	brc := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case '[':
+			brack++
+		case ']':
+			if brack > 0 {
+				brack--
+			}
+		case '{':
+			brc++
+		case '}':
+			if brc > 0 {
+				brc--
+			}
+		case ',':
+			if depth == 0 && brack == 0 && brc == 0 {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	out = append(out, s[start:])
+	return out
+}
+
+func mygoBaseMethodName(current string) (string, bool) {
+	// For renamed overloads:
+	//  - magic single-underscore: "_add_int" => base "_add"
+	//  - normal: "_Add_int" => base "Add"
+	if current == "" {
+		return "", false
+	}
+	if strings.HasPrefix(current, "_") {
+		rest := strings.TrimPrefix(current, "_")
+		if i := strings.Index(rest, "_"); i > 0 {
+			return rest[:i], true
+		}
+	}
+	return "", false
+}
+
+func mygoOverloadCandidateNames(recvT types.Type, pkg *types.Package, base string) []string {
+	if recvT == nil || base == "" {
+		return nil
+	}
+	// If the base method exists, don't treat it as overloaded.
+	if ms := types.NewMethodSet(recvT); ms != nil {
+		if sel := ms.Lookup(pkg, base); sel != nil {
+			return nil
+		}
+	}
+	if _, ok := recvT.(*types.Pointer); !ok {
+		if ms := types.NewMethodSet(types.NewPointer(recvT)); ms != nil {
+			if sel := ms.Lookup(pkg, base); sel != nil {
+				return nil
+			}
+		}
+	}
+
+	var pfx string
+	if strings.HasPrefix(base, "_") && mygomagic.IsSingleUnderscoreMagic(base) {
+		pfx = base + "_"
+	} else {
+		pfx = "_" + base + "_"
+	}
+
+	seen := make(map[string]bool)
+	add := func(t types.Type) {
+		ms := types.NewMethodSet(t)
+		for i := 0; i < ms.Len(); i++ {
+			sel := ms.At(i)
+			if sel == nil || sel.Obj() == nil {
+				continue
+			}
+			n := sel.Obj().Name()
+			if strings.HasPrefix(n, pfx) && !seen[n] {
+				seen[n] = true
+			}
+		}
+	}
+	add(recvT)
+	if _, ok := recvT.(*types.Pointer); !ok {
+		add(types.NewPointer(recvT))
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for n := range seen {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // mygoObjectAtOriginalRange resolves the object under rng using the original

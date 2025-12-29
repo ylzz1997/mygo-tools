@@ -37,10 +37,10 @@ func BuildObjectIndex(files []*ast.File, info *types.Info) map[types.Object]Info
 	for _, f := range files {
 		for _, d := range f.Decls {
 			fd, _ := d.(*ast.FuncDecl)
-			if fd == nil || fd.Name == nil || fd.Doc == nil {
+			if fd == nil || fd.Name == nil {
 				continue
 			}
-			m, ok := metadataFromDoc(fd.Doc)
+			m, ok := metadataForFuncDecl(f, fd)
 			if !ok {
 				continue
 			}
@@ -64,6 +64,50 @@ func BuildObjectIndex(files []*ast.File, info *types.Info) map[types.Object]Info
 		}
 	}
 	return out
+}
+
+func metadataForFuncDecl(f *ast.File, fd *ast.FuncDecl) (Metadata, bool) {
+	// Prefer Doc-attached metadata (if any).
+	if fd != nil && fd.Doc != nil {
+		if m, ok := metadataFromDoc(fd.Doc); ok {
+			return m, true
+		}
+	}
+	// Fall back to scanning file comment groups that are immediately adjacent
+	// to the "func" token. This is needed because FixSrc may inject metadata
+	// as an inline block comment without newlines to preserve physical line
+	// structure for LSP diagnostics.
+	return metadataFromAttachedComment(f, fd)
+}
+
+func metadataFromAttachedComment(f *ast.File, fd *ast.FuncDecl) (Metadata, bool) {
+	if f == nil || fd == nil || fd.Pos() == token.NoPos {
+		return Metadata{}, false
+	}
+	// We consider a comment group "attached" if it ends just before the func
+	// keyword, allowing for a small amount of whitespace.
+	const maxGap = token.Pos(8) // spaces/tabs between comment and 'func'
+
+	var best Metadata
+	okBest := false
+	for _, cg := range f.Comments {
+		if cg == nil {
+			continue
+		}
+		end := cg.End()
+		if end == token.NoPos {
+			continue
+		}
+		gap := fd.Pos() - end
+		if gap < 0 || gap > maxGap {
+			continue
+		}
+		if m, ok := metadataFromDoc(cg); ok {
+			best = m
+			okBest = true
+		}
+	}
+	return best, okBest
 }
 
 func metadataFromDoc(doc *ast.CommentGroup) (Metadata, bool) {

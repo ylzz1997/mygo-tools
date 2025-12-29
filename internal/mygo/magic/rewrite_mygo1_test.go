@@ -6,18 +6,28 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
-	"path/filepath"
 	"testing"
 )
 
-// This test mirrors the user's README-style sample in mygo/1.go and ensures that
-// the tooling rewrite can eliminate bogus go/types errors for operator overloading.
+// This test ensures that the tooling rewrite can eliminate bogus go/types errors
+// for operator overloading.
 func TestRewrite_Mygo1_OperatorsAndReverse(t *testing.T) {
-	srcPath := filepath.FromSlash("../../..//mygo/1.go")
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, srcPath, nil, parser.ParseComments)
+	const src = `package main
+
+type Vec struct{ X int }
+
+func (v Vec) _add(o Vec) Vec { return Vec{X: v.X + o.X} }
+func (v Vec) _radd(o Vec) Vec { return Vec{X: o.X + v.X} }
+
+func main() {
+	var a, b Vec
+	_ = a + b
+}
+`
+	f, err := parser.ParseFile(fset, "mygo1.go", []byte(src), parser.ParseComments)
 	if err != nil {
-		t.Fatalf("parse %s: %v", srcPath, err)
+		t.Fatalf("parse: %v", err)
 	}
 
 	// 1) preliminary typecheck (expected to have errors in pure Go form)
@@ -41,7 +51,7 @@ func TestRewrite_Mygo1_OperatorsAndReverse(t *testing.T) {
 
 	// Guard: ensure the heuristic would run in gopls.
 	if !NeedsRewrite([]*ast.File{f}) {
-		t.Fatalf("NeedsRewrite=false for %s; test setup invalid", srcPath)
+		t.Fatalf("NeedsRewrite=false; test setup invalid")
 	}
 
 	// 2) Apply MyGO magic rewrite using the (possibly partial) precheck info.

@@ -18,6 +18,7 @@ import (
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/internal/event"
+	mygodefaults "golang.org/x/tools/internal/mygo/defaults"
 	"golang.org/x/tools/internal/typesinternal"
 )
 
@@ -153,7 +154,47 @@ loop:
 		return nil, err
 	}
 	s.name = name
+
+	// MyGO: show default parameter values in signature help.
+	//
+	// We mutate s.params so that:
+	// - SignatureInformation.Label (name + Format()) includes defaults
+	// - ParameterInformation.Label includes defaults
+	if fn, _ := obj.(*types.Func); fn != nil {
+		mygoAugmentSignatureWithDefaults(s, pkg, fn)
+	}
+
 	return signatureInformation(s, snapshot.Options(), pos, callExpr)
+}
+
+func mygoAugmentSignatureWithDefaults(s *signature, originPkg *cache.Package, fn *types.Func) {
+	if s == nil || originPkg == nil || fn == nil {
+		return
+	}
+
+	// Prefer looking up defaults using the already type-checked origin package,
+	// which is the common case for same-package calls.
+	var di mygodefaults.Info
+	if idx := mygodefaults.BuildObjectIndex(originPkg.Syntax(), originPkg.TypesInfo()); idx != nil {
+		if v, ok := idx[fn]; ok {
+			di = v
+		}
+	}
+	if len(di.Names) == 0 || len(di.Names) != len(di.Exprs) {
+		return
+	}
+	for i, p := range s.params {
+		// Params are formatted as either:
+		// - "name type"
+		// - "type" (unnamed)
+		name, _, ok := strings.Cut(p, " ")
+		if !ok || name == "" {
+			continue
+		}
+		if expr, ok := mygoDefaultExprForParam(di, name); ok {
+			s.params[i] = p + " = " + expr
+		}
+	}
 }
 
 func signatureInformation(sig *signature, options *settings.Options, pos token.Pos, call *ast.CallExpr) (*protocol.SignatureInformation, error) {

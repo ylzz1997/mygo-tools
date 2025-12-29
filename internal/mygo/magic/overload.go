@@ -107,6 +107,16 @@ func isSingleUnderscoreMagic(methodName string) bool {
 	}
 }
 
+// IsSingleUnderscoreMagic reports whether methodName is one of the special
+// MyGO magic method names that already begin with a single underscore (e.g.
+// "_add", "_getitem").
+//
+// Overloaded variants of these methods are named by appending a suffix, rather
+// than prepending another underscore.
+func IsSingleUnderscoreMagic(methodName string) bool {
+	return isSingleUnderscoreMagic(methodName)
+}
+
 func exprToString(fset *token.FileSet, e ast.Expr) string {
 	if e == nil {
 		return ""

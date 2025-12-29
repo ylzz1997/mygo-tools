@@ -158,11 +158,14 @@ func lexicalSemanticTokens(uri protocol.DocumentURI, content []byte, rng *protoc
 		if tok == token.IDENT && isMyGOKeyword(lit) {
 			return semtok.TokKeyword, true
 		}
-		// Highlight MyGO operators (and other punctuation) as operator.
-		switch tok {
-		case token.OPTIONAL_DOT, token.QUESTION, token.COLON:
-			return semtok.TokOperator, true
-		}
+	// Highlight MyGO operators (and other punctuation) as operator.
+	// Note: We check for MyGO tokens by name to avoid compilation errors
+	// when building with standard Go toolchain (which doesn't have these tokens).
+	tokStr := tok.String()
+	switch tokStr {
+	case "?.", "?", ":", "@":
+		return semtok.TokOperator, true
+	}
 		// For lexical fallback, keep operator highlighting conservative:
 		// only obvious operator tokens plus a small whitelist above.
 		if tok.IsOperator() {
@@ -251,12 +254,12 @@ func lexicalSemanticTokens(uri protocol.DocumentURI, content []byte, rng *protoc
 			// If token.Pos is invalid, ignore token for semantic highlighting.
 			continue
 		}
-		// Combine contiguous "?:"
-		if tok == token.QUESTION {
-			pendingQ = true
-			pendingQOff = off
-			continue
-		}
+	// Combine contiguous "?:"
+	if tok.String() == "?" {
+		pendingQ = true
+		pendingQOff = off
+		continue
+	}
 		if tok == token.COLON && pendingQ && off == pendingQOff+1 {
 			emit(pendingQOff, 2, semtok.TokOperator)
 			pendingQ = false
@@ -267,17 +270,17 @@ func lexicalSemanticTokens(uri protocol.DocumentURI, content []byte, rng *protoc
 			pendingQ = false
 		}
 
-		// Decorator: "@decorator" -> emit '@' as operator and the following IDENT as macro.
-		if tok == token.AT {
-			// "Standard" decorator syntax: only treat '@' as decorator marker when it
-			// appears at the start of a (possibly indented) line.
-			pendingDecoratorLineStart = isLineStartAfterIndent(off)
-			if pendingDecoratorLineStart {
-				emit(off, 1, semtok.TokOperator)
-				pendingDecorator = true
-			}
-			continue
+	// Decorator: "@decorator" -> emit '@' as operator and the following IDENT as macro.
+	if tok.String() == "@" {
+		// "Standard" decorator syntax: only treat '@' as decorator marker when it
+		// appears at the start of a (possibly indented) line.
+		pendingDecoratorLineStart = isLineStartAfterIndent(off)
+		if pendingDecoratorLineStart {
+			emit(off, 1, semtok.TokOperator)
+			pendingDecorator = true
 		}
+		continue
+	}
 		if pendingDecorator {
 			// Be conservative: only the immediately following identifier is treated as decorator name.
 			if pendingDecoratorLineStart && tok == token.IDENT && lit != "" {

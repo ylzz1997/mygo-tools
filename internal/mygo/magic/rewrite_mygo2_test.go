@@ -6,17 +6,32 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
-	"path/filepath"
 	"testing"
 )
 
-// Regression test for mygo/2.go native synthesis + pointer-receiver _init workaround.
+// Regression test for comma-indexing FixSrc + magic rewrite.
 func TestRewrite_Mygo2_NativeSetitemAndPtrInit(t *testing.T) {
-	srcPath := filepath.FromSlash("../../..//mygo/2.go")
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, srcPath, nil, parser.ParseComments)
+	const src = `package main
+
+type Seq struct{}
+
+func (Seq) _getitem(i []int, j []int) int { return 0 }
+func (Seq) _setitem(v int, i []int, j []int) {}
+
+func main() {
+	var seq Seq
+	seq[1, 2] = 3
+	_ = seq[1, 2]
+}
+`
+	fixed, _ := FixSrc("mygo2.go", []byte(src))
+	if fixed == nil {
+		fixed = []byte(src)
+	}
+	f, err := parser.ParseFile(fset, "mygo2.go", fixed, parser.ParseComments)
 	if err != nil {
-		t.Fatalf("parse %s: %v", srcPath, err)
+		t.Fatalf("parse: %v\n---src---\n%s", err, string(fixed))
 	}
 
 	info1 := &types.Info{
@@ -35,7 +50,7 @@ func TestRewrite_Mygo2_NativeSetitemAndPtrInit(t *testing.T) {
 	_ = types.NewChecker(cfg1, fset, pkg1, info1).Files([]*ast.File{f})
 
 	if !NeedsRewrite([]*ast.File{f}) {
-		t.Fatalf("NeedsRewrite=false for %s; test setup invalid", srcPath)
+		t.Fatalf("NeedsRewrite=false; test setup invalid")
 	}
 
 	Rewrite([]*ast.File{f}, pkg1, info1)

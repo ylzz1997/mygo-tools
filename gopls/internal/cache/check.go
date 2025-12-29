@@ -1650,6 +1650,7 @@ func (b *typeCheckBatch) checkPackage(ctx context.Context, fset *token.FileSet, 
 		//  4) run the real typecheck.
 		needMyGO := false
 		needMagic := false
+		needDefaults := false
 		var origFiles []*ast.File
 		for _, cgf := range pkg.compiledGoFiles {
 			origFiles = append(origFiles, cgf.File)
@@ -1659,7 +1660,8 @@ func (b *typeCheckBatch) checkPackage(ctx context.Context, fset *token.FileSet, 
 		}
 		enumIdx := mygoenum.BuildIndex(origFiles)
 		needMagic = mygomagic.NeedsRewrite(origFiles)
-		needRewrite := needMyGO || enumIdx.HasAny() || needMagic
+		needDefaults = mygodefaults.HasAnyMetadata(origFiles)
+		needRewrite := needMyGO || enumIdx.HasAny() || needMagic || needDefaults
 		if needRewrite {
 			clonePGF := func(pgf *parsego.File) *parsego.File {
 				return &parsego.File{
