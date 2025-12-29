@@ -40,6 +40,14 @@ func Format(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle) ([]pr
 		return nil, err
 	}
 
+	// MyGO: pgf.Src may be in the "fixed source" domain (produced by parsego.Parse
+	// via internal/mygo/* FixSrc). In that case, offsets in edits computed from
+	// pgf.Src do not match the user's original buffer, and applying them will
+	// corrupt the file. Until we have a proper offset map, disable formatting.
+	if orig, err := fh.Content(); err == nil && !bytes.Equal(orig, pgf.Src) {
+		return nil, nil
+	}
+
 	// Even if this file has parse errors, it might still be possible to format it.
 	// Using format.Node on an AST with errors may result in code being modified.
 	// Attempt to format the source of this file instead.
@@ -115,6 +123,15 @@ type importFix struct {
 func allImportsFixes(ctx context.Context, snapshot *cache.Snapshot, pgf *parsego.File) (allFixEdits []protocol.TextEdit, editsPerFix []*importFix, err error) {
 	ctx, done := event.Start(ctx, "golang.allImportsFixes")
 	defer done()
+
+	// MyGO: see comment in Format. Import fixes also compute edits in the pgf.Src
+	// domain, so applying them to the editor buffer will corrupt files when pgf.Src
+	// differs from the original content.
+	if fh, err := snapshot.ReadFile(ctx, pgf.URI); err == nil {
+		if orig, err := fh.Content(); err == nil && !bytes.Equal(orig, pgf.Src) {
+			return nil, nil, nil
+		}
+	}
 
 	if err := snapshot.RunProcessEnvFunc(ctx, func(ctx context.Context, opts *imports.Options) error {
 		allFixEdits, editsPerFix, err = computeImportEdits(ctx, pgf, snapshot, opts)

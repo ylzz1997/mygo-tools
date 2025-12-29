@@ -2109,6 +2109,84 @@ func missingPkgError(from PackageID, pkgPath string, viewType ViewType) error {
 func typeErrorsToDiagnostics(pkg *syntaxPackage, inputs *typeCheckInputs, errs []types.Error) []*Diagnostic {
 	var result []*Diagnostic
 
+	// Helper to locate the original (editor) source for a given URI.
+	// Note: pgf.Src may be "fixed source" produced by parsego.Parse (MyGO FixSrc),
+	// which does not necessarily align with the editor buffer.
+	fileHandleForURI := func(uri protocol.DocumentURI) (file.Handle, bool) {
+		for _, fh := range inputs.compiledGoFiles {
+			if fh.URI() == uri {
+				return fh, true
+			}
+		}
+		for _, fh := range inputs.goFiles {
+			if fh.URI() == uri {
+				return fh, true
+			}
+		}
+		return nil, false
+	}
+
+	// bestEffortRangeFromTokenPositions maps token positions (line/col) into the
+	// original editor buffer for uri, returning ok=false if it can't.
+	bestEffortRangeFromTokenPositions := func(uri protocol.DocumentURI, startPosn, endPosn token.Position) (protocol.Range, bool) {
+		fh, ok := fileHandleForURI(uri)
+		if !ok {
+			return protocol.Range{}, false
+		}
+		orig, err := fh.Content()
+		if err != nil || len(orig) == 0 {
+			return protocol.Range{}, false
+		}
+		// token.Position uses 1-based Line/Column; Column is a byte offset in the line.
+		offsetAt := func(line, col int) (int, bool) {
+			if line <= 0 || col <= 0 {
+				// When positions originate from //line directives, go/token may report
+				// Column==0. Treat it as "start of line" rather than failing the map.
+				if line <= 0 {
+					return 0, false
+				}
+				col = 1
+			}
+			// Find start of the requested line (1-based).
+			ln := 1
+			off := 0
+			for ln < line && off < len(orig) {
+				if orig[off] == '\n' {
+					ln++
+				}
+				off++
+			}
+			if ln != line {
+				return 0, false
+			}
+			// Advance by (col-1) bytes, clamped to end of line/buffer.
+			off += col - 1
+			if off < 0 {
+				off = 0
+			}
+			if off > len(orig) {
+				off = len(orig)
+			}
+			return off, true
+		}
+
+		startOff, ok1 := offsetAt(startPosn.Line, startPosn.Column)
+		endOff, ok2 := offsetAt(endPosn.Line, endPosn.Column)
+		if !ok1 || !ok2 {
+			return protocol.Range{}, false
+		}
+		if endOff < startOff {
+			endOff = startOff
+		}
+
+		origMapper := protocol.NewMapper(uri, orig)
+		rng, err := origMapper.OffsetRange(startOff, endOff)
+		if err != nil {
+			return protocol.Range{}, false
+		}
+		return rng, true
+	}
+
 	// batch records diagnostics for a set of related types.Errors.
 	// (related[0] is the primary error.)
 	batch := func(related []types.Error) {
@@ -2217,6 +2295,27 @@ func typeErrorsToDiagnostics(pkg *syntaxPackage, inputs *typeCheckInputs, errs [
 			if err != nil {
 				bug.Reportf("internal error: could not compute pos to range for %v: %v", e, err)
 				continue
+			}
+			// MyGO: if pgf.Src is in the "fixed source" domain, the above range may
+			// not align with the editor buffer. Prefer mapping via token.Position
+			// (which respects //line directives inserted by FixSrc) into the original
+			// file content when available.
+			if fh, ok := fileHandleForURI(pgf.URI); ok {
+				if orig, err := fh.Content(); err == nil && !bytes.Equal(orig, pgf.Src) {
+					startPosn := safetoken.StartPosition(e.Fset, start)
+					endPosn := safetoken.EndPosition(e.Fset, end)
+					// Relax filename check: if startPosn.Filename is a suffix of the URI path, accept it.
+					// FixSrc uses filepath.Base() in //line directives to avoid full path mismatches.
+					uriPath := pgf.URI.Path()
+					matches := startPosn.Filename == endPosn.Filename &&
+						(startPosn.Filename == uriPath || strings.HasSuffix(uriPath, startPosn.Filename))
+
+					if startPosn.IsValid() && endPosn.IsValid() && matches {
+						if rng2, ok := bestEffortRangeFromTokenPositions(pgf.URI, startPosn, endPosn); ok {
+							rng = rng2
+						}
+					}
+				}
 			}
 			msg := related[0].Msg // primary
 			if i > 0 {

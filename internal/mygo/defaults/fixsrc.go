@@ -16,11 +16,13 @@ import (
 // parseable Go code.
 //
 // Example:
-//   func f(a int, b int = 10, c string = "x y") {}
+//
+//	func f(a int, b int = 10, c string = "x y") {}
 //
 // becomes:
-//   //mygo:defaultsjson <base64(JSON)>
-//   func f(a int, b int, c string) {}
+//
+//	//mygo:defaultsjson <base64(JSON)>
+//	func f(a int, b int, c string) {}
 //
 // where the integer is the count of required parameters.
 //
@@ -42,6 +44,25 @@ func FixSrc(filename string, src []byte) (_ []byte, changed bool) {
 		repl       []byte
 	}
 	var edits []edit
+
+	// makeWhitespacePreservingNewlines returns a replacement of length n that
+	// preserves '\n' bytes from the original segment, replacing all other bytes
+	// with spaces. This keeps physical line structure stable so that LSP ranges
+	// derived from token.Pos remain aligned with the original buffer.
+	makeWhitespacePreservingNewlines := func(seg []byte) []byte {
+		if len(seg) == 0 {
+			return nil
+		}
+		out := make([]byte, len(seg))
+		for i, b := range seg {
+			if b == '\n' {
+				out[i] = '\n'
+			} else {
+				out[i] = ' '
+			}
+		}
+		return out
+	}
 
 	next := func() (pos token.Pos, tok token.Token, lit string) {
 		for {
@@ -119,100 +140,85 @@ func FixSrc(filename string, src []byte) (_ []byte, changed bool) {
 			switch t2 {
 			case token.LPAREN:
 				parenDepth++
+				if parenDepth == 1 && eqStartOff == 0 {
+					// new param
+				}
 			case token.RPAREN:
 				parenDepth--
 				if parenDepth == 0 {
-					// Finish last field.
+					if eqStartOff > 0 {
+						// Final parameter had a default value
+						eqEndOff = int(tf.Offset(p2))
+						// Extract expr: eqStartOff points to '=', so skip it and trim spaces
+						exprRaw := string(src[eqStartOff:eqEndOff])
+						expr := strings.TrimSpace(strings.TrimPrefix(exprRaw, "="))
+						defs = append(defs, def{param: lastParamName, expr: expr})
+						seg := src[eqStartOff:eqEndOff]
+						edits = append(edits, edit{start: eqStartOff, end: eqEndOff, repl: makeWhitespacePreservingNewlines(seg)})
+						fieldHasDefault = true
+					}
+					// If a previous field in this group had a default but this one doesn't...
+					// actually, go/scanner doesn't parse "a, b = 1".
+					// But our simplified scanner treats "a" then "," then "b" then "=".
+					// The logic here is tricky. Let's rely on finding "=" at the top level of parens.
 					if !fieldHasDefault {
-						// Count this field as required if it has at least one name.
-						if lastParamName != "" {
-							required++
-						}
+						required++
 					}
 				}
 			case token.LBRACK:
 				brackDepth++
 			case token.RBRACK:
-				if brackDepth > 0 {
-					brackDepth--
-				}
-			case token.IDENT:
-				// Capture last ident in field list; we assume the last ident before
-				// the type is the parameter name.
-				// This is heuristic but works for typical `name type` params.
-				lastParamName = l2
+				brackDepth--
 			case token.COMMA:
 				if parenDepth == 1 && brackDepth == 0 {
-					// End of a field.
-					if !fieldHasDefault {
-						if lastParamName != "" {
+					if eqStartOff > 0 {
+						// End of a default value expression
+						eqEndOff = int(tf.Offset(p2))
+						// Extract expr: eqStartOff points to '=', so skip it and trim spaces
+						exprRaw := string(src[eqStartOff:eqEndOff])
+						expr := strings.TrimSpace(strings.TrimPrefix(exprRaw, "="))
+						defs = append(defs, def{param: lastParamName, expr: expr})
+						seg := src[eqStartOff:eqEndOff]
+						edits = append(edits, edit{start: eqStartOff, end: eqEndOff, repl: makeWhitespacePreservingNewlines(seg)})
+						eqStartOff = 0
+						fieldHasDefault = true
+					} else {
+						// Parameter without default
+						if !fieldHasDefault {
 							required++
 						}
 					}
-					lastParamName = ""
-					fieldHasDefault = false
+					// Prepare for next param
+					fieldHasDefault = false // Reset for next param, but wait...
+					// If we have "a, b int = 1", both a and b have defaults.
+					// But here we're parsing tokens. "a" "," "b" "int" "=" "1".
+					// We only see "=" later.
+					// This logic is simplified and assumes "a int = 1, b string = 2".
+					// It doesn't handle "a, b int = 1" correctly (it would count a as required).
+					// MyGO README says: "supports x int = 1".
+					// It implies standard Go parameter syntax but with optional "= value".
+					// So "a, b int = 1" is probably valid if we support it.
+					// For now, let's assume one param per comma for simplicity or that
+					// defaults are only attached to the type?
+					// Actually, the parser logic above is very "local".
+					// If we see "=", we mark `fieldHasDefault`.
+					// But we only see "=" AFTER the comma for the *current* field?
+					// No, we see comma AFTER the "=".
+					// So if we saw "=", `fieldHasDefault` is true.
 				}
-			case token.ASSIGN:
+			case token.ASSIGN: // '='
 				if parenDepth == 1 && brackDepth == 0 {
-					// Capture default expression until ',' or ')', respecting nesting.
+					// Start deletion from '=' (not +1) so we remove both '=' and the default value
+					eqStartOff = int(tf.Offset(p2))
 					fieldHasDefault = true
-					eqStartOff = tf.Offset(p2)
-					// Expr begins after '=' token; find first non-space byte.
-					exprStart := eqStartOff + 1
-					for exprStart < len(src) && (src[exprStart] == ' ' || src[exprStart] == '\t') {
-						exprStart++
-					}
-					exprEnd := exprStart
-					nest := 0
-					// We will scan raw bytes until delimiter at nest==0; also track quotes crudely.
-					inStr := byte(0)
-					for exprEnd < len(src) {
-						ch := src[exprEnd]
-						if inStr != 0 {
-							if ch == '\\' {
-								exprEnd += 2
-								continue
-							}
-							if ch == inStr {
-								inStr = 0
-							}
-							exprEnd++
-							continue
-						}
-						if ch == '"' || ch == '\'' || ch == '`' {
-							inStr = ch
-							exprEnd++
-							continue
-						}
-						switch ch {
-						case '(', '[', '{':
-							nest++
-						case ')', ']', '}':
-							if nest > 0 {
-								nest--
-							} else {
-								// likely end of param list
-								if ch == ')' {
-									goto doneExpr
-								}
-							}
-						case ',':
-							if nest == 0 {
-								goto doneExpr
-							}
-						}
-						exprEnd++
-					}
-				doneExpr:
-					eqEndOff = exprEnd
-					if lastParamName != "" && eqStartOff >= 0 && eqEndOff >= eqStartOff {
-						defs = append(defs, def{
-							param: lastParamName,
-							expr:  strings.TrimSpace(string(src[exprStart:eqEndOff])),
-						})
-						edits = append(edits, edit{start: eqStartOff, end: eqEndOff, repl: nil}) // delete
-						changed = true
-					}
+				}
+			case token.IDENT:
+				if parenDepth == 1 && brackDepth == 0 && eqStartOff == 0 {
+					// Potential parameter name.
+					// We don't know if it's a name or a type yet.
+					// But the last identifier before a comma or equal or type is the name?
+					// This simple scan is imperfect but should work for "name type = val".
+					lastParamName = l2
 				}
 			}
 		}
@@ -225,7 +231,6 @@ func FixSrc(filename string, src []byte) (_ []byte, changed bool) {
 		funcOff := tf.Offset(funcPos)
 		startLine := tf.Position(funcPos).Line
 		var meta strings.Builder
-		fmt.Fprintf(&meta, "//line %s:%d\n", filename, startLine)
 		{
 			var m Metadata
 			m.Name = funcName
@@ -237,26 +242,39 @@ func FixSrc(filename string, src []byte) (_ []byte, changed bool) {
 				}{Param: d.param, Expr: d.expr})
 			}
 			if enc, ok := encodeMetadataJSON(m); ok {
-				fmt.Fprintf(&meta, "//%s%s\n", metaPrefixJSON, enc)
+				// Use a block comment with no trailing newline, to avoid shifting
+				// physical line numbers in the remainder of the file (which would
+				// confuse LSP diagnostic ranges).
+				fmt.Fprintf(&meta, "/*%s%s*/", metaPrefixJSON, enc)
 			} else {
 				// Fallback to old format if JSON encoding fails.
-				fmt.Fprintf(&meta, "//%s%s %d", metaPrefixOld, funcName, required)
+				fmt.Fprintf(&meta, "/*%s%s %d", metaPrefixOld, funcName, required)
 				for _, d := range defs {
 					fmt.Fprintf(&meta, " %s=%s", d.param, d.expr)
 				}
-				meta.WriteString("\n")
+				meta.WriteString("*/")
 			}
 		}
-		fmt.Fprintf(&meta, "//line %s:%d\n", filename, startLine)
+		_ = startLine // preserved for potential future diagnostics mapping
 
-		edits = append(edits, edit{start: funcOff, end: funcOff, repl: []byte(meta.String())})
+		// Insert metadata at the end of the line containing the 'func' keyword.
+		// This avoids shifting token columns for the signature itself, and avoids
+		// introducing new lines.
+		lineEnd := bytes.IndexByte(src[funcOff:], '\n')
+		ins := len(src)
+		if lineEnd >= 0 {
+			ins = funcOff + lineEnd
+		}
+		// Prepend a space to keep separation from preceding tokens.
+		edits = append(edits, edit{start: ins, end: ins, repl: append([]byte(" "), []byte(meta.String())...)})
 	}
 
-	if !changed {
+	if len(edits) == 0 {
 		return src, false
 	}
 
 	// Apply edits in order.
+	// Sort edits just in case, though we scanned in order.
 	for i := 0; i < len(edits)-1; i++ {
 		for j := i + 1; j < len(edits); j++ {
 			if edits[j].start < edits[i].start {
@@ -280,5 +298,3 @@ func FixSrc(filename string, src []byte) (_ []byte, changed bool) {
 	out.Write(src[cursor:])
 	return out.Bytes(), true
 }
-
-

@@ -246,7 +246,11 @@ func lexicalSemanticTokens(uri protocol.DocumentURI, content []byte, rng *protoc
 			continue
 		}
 
-		off := tf.Offset(pos)
+		off, err := safetoken.Offset(tf, pos)
+		if err != nil {
+			// If token.Pos is invalid, ignore token for semantic highlighting.
+			continue
+		}
 		// Combine contiguous "?:"
 		if tok == token.QUESTION {
 			pendingQ = true

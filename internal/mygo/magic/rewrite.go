@@ -1606,6 +1606,11 @@ func rewriteChanOps(file *ast.File, pkg *types.Package, info *types.Info) {
 			if iface == nil {
 				return false
 			}
+			// Important: instantiated interfaces in go/types may be incomplete until
+			// Interface.Complete is called (see golang/go#61561). If we don't complete
+			// here, iface.NumMethods may be 0 and we'll miss magic methods in generic
+			// constraints like `S Seq[T]`.
+			iface = iface.Complete()
 			for i := 0; i < iface.NumMethods(); i++ {
 				m := iface.Method(i)
 				if m == nil || m.Name() != name {
@@ -1863,6 +1868,43 @@ func rewriteIndexing(file *ast.File, pkg *types.Package, info *types.Info) {
 				call := makeMethodCall(lhs.X, name, args)
 				c.Replace(&ast.ExprStmt{X: call})
 				return false
+			case *ast.IndexListExpr:
+				// a[i, j] = v  ==>  a._setitem(v, []int{i}, []int{j}) (if _setitem exists)
+				//
+				// Note: we intentionally don't do source-level rewriting for x[i, j]
+				// because it would be ambiguous with generics (T[K, V]). By the time
+				// we get here, go/parser has produced an IndexListExpr and we can
+				// decide based on context and receiver type info.
+				recvT := typeOfExpr(info, lhs.X)
+				if recvT == nil {
+					return true
+				}
+				// Don't touch generic function instantiations in assignment contexts
+				// (shouldn't type-check anyway, but be defensive).
+				if _, ok := recvT.(*types.Signature); ok {
+					return true
+				}
+				// Encode each dimension as []int{expr}, consistent with FixSrc encoding.
+				mkSeg := func(e ast.Expr) ast.Expr {
+					return &ast.CompositeLit{
+						Type: &ast.ArrayType{Elt: &ast.Ident{Name: "int"}},
+						Elts: []ast.Expr{e},
+					}
+				}
+				args := []ast.Expr{n.Rhs[0]}
+				for _, idx := range lhs.Indices {
+					args = append(args, mkSeg(idx))
+				}
+				name, ok := chooseMagicMethodName(recvT, pkg, info, "_setitem", args)
+				if !ok {
+					if !hasConstraintMethod(recvT, "_setitem", len(args)) {
+						return true
+					}
+					name, ok = "_setitem", true
+				}
+				call := makeMethodCall(lhs.X, name, args)
+				c.Replace(&ast.ExprStmt{X: call})
+				return false
 			case *ast.SliceExpr:
 				recvT := info.TypeOf(lhs.X)
 				if recvT == nil {
@@ -1894,6 +1936,47 @@ func rewriteIndexing(file *ast.File, pkg *types.Package, info *types.Info) {
 			// a[i]  ==>  a._getitem(i) (if _getitem exists)
 			recvT := typeOfExpr(info, n.X)
 			args := []ast.Expr{n.Index}
+			name, ok := chooseMagicMethodName(recvT, pkg, info, "_getitem", args)
+			if !ok {
+				if !hasConstraintMethod(recvT, "_getitem", len(args)) {
+					return true
+				}
+				name, ok = "_getitem", true
+			}
+			call := makeMethodCall(n.X, name, args)
+			c.Replace(call)
+			return false
+
+		case *ast.IndexListExpr:
+			// a[i, j]  ==>  a._getitem([]int{i}, []int{j}) (if _getitem exists)
+			//
+			// Skip type-context instantiations like Seq2[K, V] used in types.
+			switch c.Parent().(type) {
+			case *ast.Field, *ast.ValueSpec, *ast.TypeSpec, *ast.CompositeLit,
+				*ast.ArrayType, *ast.MapType, *ast.ChanType, *ast.StructType, *ast.InterfaceType,
+				*ast.FuncType:
+				if c.Name() == "Type" || c.Name() == "Elt" || c.Name() == "Key" || c.Name() == "Value" {
+					return true
+				}
+			}
+			recvT := typeOfExpr(info, n.X)
+			if recvT == nil {
+				return true
+			}
+			// Don't touch generic function instantiations like f[int, string].
+			if _, ok := recvT.(*types.Signature); ok {
+				return true
+			}
+			mkSeg := func(e ast.Expr) ast.Expr {
+				return &ast.CompositeLit{
+					Type: &ast.ArrayType{Elt: &ast.Ident{Name: "int"}},
+					Elts: []ast.Expr{e},
+				}
+			}
+			var args []ast.Expr
+			for _, idx := range n.Indices {
+				args = append(args, mkSeg(idx))
+			}
 			name, ok := chooseMagicMethodName(recvT, pkg, info, "_getitem", args)
 			if !ok {
 				if !hasConstraintMethod(recvT, "_getitem", len(args)) {

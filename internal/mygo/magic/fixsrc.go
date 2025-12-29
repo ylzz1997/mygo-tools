@@ -86,26 +86,50 @@ func FixSrc(filename string, src []byte) ([]byte, bool) {
 		}
 	}
 
-	lastIdentStartsUpper := func(b []byte) bool {
-		b = bytes.TrimSpace(b)
-		if len(b) == 0 {
-			return false
-		}
-		if i := bytes.LastIndexByte(b, '.'); i >= 0 {
-			b = b[i+1:]
-		}
-		b = bytes.TrimSpace(b)
-		if len(b) == 0 {
-			return false
-		}
-		c := b[0]
-		return c >= 'A' && c <= 'Z'
-	}
-
 	looksDefinitelyTypeArg := func(b []byte) bool {
 		b = bytes.TrimSpace(b)
 		if len(b) == 0 {
 			return false
+		}
+		// Allow type approximations in constraints: ~T
+		if b[0] == '~' {
+			b = bytes.TrimSpace(b[1:])
+		}
+		// Type parameter declarations look like "T any", "K comparable", "V interface{...}".
+		// In these cases, the first token is the type parameter name.
+		if i := bytes.IndexFunc(b, func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' || r == '\r' }); i > 0 {
+			head := bytes.TrimSpace(b[:i])
+			if isASCIIIdent(head) {
+				c := head[0]
+				if c >= 'A' && c <= 'Z' {
+					return true
+				}
+			}
+		}
+		// Generic instantiation used as a type argument can itself be a type,
+		// e.g. `A[E]`, `B[int, A[E]]`. In that case, the segment looks like
+		// "Ident[...]" or "pkg.Ident[...]" (possibly with spaces).
+		// Treat it as typey so we don't rewrite generics as comma indexing.
+		{
+			trim := bytes.TrimSpace(b)
+			if i := bytes.IndexByte(trim, '['); i > 0 {
+				// Find a head like "A" or "pkg.A".
+				head := bytes.TrimSpace(trim[:i])
+				if len(head) > 0 && (isASCIIIdent(head) || (bytes.Contains(head, []byte(".")) && func() bool {
+					parts := bytes.Split(head, []byte("."))
+					if len(parts) < 2 {
+						return false
+					}
+					for _, p := range parts {
+						if !isASCIIIdent(p) {
+							return false
+						}
+					}
+					return true
+				}())) {
+					return true
+				}
+			}
 		}
 		// Composite/keyword types can't be value expressions without a type context.
 		switch {
@@ -124,9 +148,27 @@ func FixSrc(filename string, src []byte) ([]byte, bool) {
 		if isPredeclaredTypeIdent(b) {
 			return true
 		}
+		// Heuristic: an identifier starting with an uppercase letter is very likely a type
+		// argument (either a named type or a type parameter like K/V/T).
+		if isASCIIIdent(b) {
+			c := b[0]
+			return c >= 'A' && c <= 'Z'
+		}
 		// Heuristic: pkg.ExportedType is likely a type argument.
-		if bytes.Contains(b, []byte(".")) && lastIdentStartsUpper(b) {
-			return true
+		if bytes.Contains(b, []byte(".")) {
+			parts := bytes.Split(b, []byte("."))
+			if len(parts) >= 2 {
+				for _, p := range parts {
+					if !isASCIIIdent(p) {
+						return false
+					}
+				}
+				last := parts[len(parts)-1]
+				if len(last) > 0 {
+					c := last[0]
+					return c >= 'A' && c <= 'Z'
+				}
+			}
 		}
 		return false
 	}
@@ -663,14 +705,14 @@ func FixSrc(filename string, src []byte) ([]byte, bool) {
 		}
 		inner := src[open+1 : close]
 
-		// split by commas; only rewrite if a top-level comma exists.
+		// split by commas; only consider rewriting if a top-level comma exists.
 		parts, hasComma := splitTopLevelCommas(inner)
 		if !hasComma {
 			i = close + 1
 			continue
 		}
 
-		// trim trailing spaces before '[' (avoid "x [i,j]" -> "x ._getitem")
+		// trim trailing spaces before '[' (avoid "x [i:j, k]" -> "x ._getitem")
 		trimOpen := open
 		for trimOpen > emitUntil {
 			b := src[trimOpen-1]
@@ -684,12 +726,15 @@ func FixSrc(filename string, src []byte) ([]byte, bool) {
 			break
 		}
 
-		// Ambiguity reduction: don't rewrite very-likely generic instantiations like f[int, string]
-		// (which are valid Go and should remain intact).
+		// Ambiguity reduction: don't rewrite very-likely generic instantiations like
+		// `T[K, V]` (valid Go) into MyGO indexing. This matters most in type contexts
+		// such as parameter types, where K/V are type parameters and look like plain
+		// identifiers.
+		//
 		// We only skip when:
-		// - no segment has top-level ':' (since ':' implies slice indexing)
+		// - no segment has top-level ':' (since ':' implies slice indexing, not generics)
 		// - receiver looks like ident/selector
-		// - every segment looks definitely like a type argument (strict heuristic)
+		// - every segment looks definitely like a type argument (best-effort heuristic)
 		noColon := true
 		for _, p := range parts {
 			if hasTopLevelColon(p) {

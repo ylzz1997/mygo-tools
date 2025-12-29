@@ -5,12 +5,14 @@
 package parsego
 
 import (
+	"bytes"
 	"go/ast"
 	"go/parser"
 	"go/scanner"
 	"go/token"
 	"sync"
 	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/tools/go/ast/inspector"
 	"golang.org/x/tools/gopls/internal/protocol"
@@ -79,6 +81,49 @@ func (pgf *File) Fixed() bool {
 
 // PositionPos returns the token.Pos of protocol position p within the file.
 func (pgf *File) PositionPos(p protocol.Position) (token.Pos, error) {
+	if pgf.Fixed() {
+		// MyGO: Fixed Src may have different physical line numbers than the original file,
+		// but //line directives preserve logical line numbers.
+		// Try to map p.Line (0-based logical line) to token.Pos using logical line info.
+		line := int(p.Line) + 1
+
+		// Attempt to find the Pos for the start of the logical line.
+		var pos token.Pos
+		func() {
+			defer func() { recover() }()
+			pos = pgf.Tok.LineStart(line)
+		}()
+
+		if pos.IsValid() {
+			// Found logical line start. Now calculate column offset.
+			// p.Character is 0-based UTF-16 column.
+			offset := pgf.Tok.Offset(pos)
+			if offset < len(pgf.Src) {
+				rest := pgf.Src[offset:]
+				eol := bytes.IndexByte(rest, '\n')
+				if eol == -1 {
+					eol = len(rest)
+				}
+				lineContent := rest[:eol]
+
+				col8 := 0
+				col16 := 0
+				targetCol16 := int(p.Character)
+				for col16 < targetCol16 && col8 < len(lineContent) {
+					r, sz := utf8.DecodeRune(lineContent[col8:])
+					if r == utf8.RuneError && sz == 1 {
+						// invalid utf8, advance 1
+					} else if r >= 0x10000 {
+						col16++ // surrogate pair
+					}
+					col16++
+					col8 += sz
+				}
+				return pos + token.Pos(col8), nil
+			}
+		}
+	}
+
 	offset, err := pgf.Mapper.PositionOffset(p)
 	if err != nil {
 		return token.NoPos, err
@@ -88,17 +133,71 @@ func (pgf *File) PositionPos(p protocol.Position) (token.Pos, error) {
 
 // PosPosition returns a protocol Position for the token.Pos in this file.
 func (pgf *File) PosPosition(pos token.Pos) (protocol.Position, error) {
+	if pgf.Fixed() {
+		// Map token.Pos (which respects //line) to protocol.Position (logical line).
+		p := pgf.Tok.Position(pos) // returns 1-based logical line, byte-based column
+		if p.IsValid() {
+			// p.Column is 1-based byte offset in line.
+			// When //line directives are present, Column may be 0 or negative.
+			col8 := p.Column - 1
+			if col8 < 0 {
+				col8 = 0
+			}
+			line := p.Line - 1 // 0-based logical line
+
+			// Convert byte col to UTF-16 col.
+			offset := pgf.Tok.Offset(pos)
+			lineStartOffset := offset - col8
+			if lineStartOffset >= 0 && lineStartOffset < len(pgf.Src) {
+				rest := pgf.Src[lineStartOffset:]
+				if col8 <= len(rest) {
+					linePrefix := rest[:col8]
+					col16 := 0
+					for i := 0; i < len(linePrefix); {
+						r, sz := utf8.DecodeRune(linePrefix[i:])
+						if r == utf8.RuneError && sz == 1 {
+							// invalid utf8
+						} else if r >= 0x10000 {
+							col16++
+						}
+						col16++
+						i += sz
+					}
+					return protocol.Position{
+						Line:      uint32(line),
+						Character: uint32(col16),
+					}, nil
+				}
+			}
+		}
+	}
 	return pgf.Mapper.PosPosition(pgf.Tok, pos)
 }
 
 // PosRange returns a protocol Range for the token.Pos interval in this file.
 func (pgf *File) PosRange(start, end token.Pos) (protocol.Range, error) {
+	if pgf.Fixed() {
+		p1, err := pgf.PosPosition(start)
+		if err != nil {
+			return protocol.Range{}, err
+		}
+		p2, err := pgf.PosPosition(end)
+		if err != nil {
+			return protocol.Range{}, err
+		}
+		return protocol.Range{Start: p1, End: p2}, nil
+	}
 	return pgf.Mapper.PosRange(pgf.Tok, start, end)
 }
 
 // PosLocation returns a protocol Location for the token.Pos interval in this file.
 func (pgf *File) PosLocation(start, end token.Pos) (protocol.Location, error) {
-	return pgf.Mapper.PosLocation(pgf.Tok, start, end)
+	// PosRange handles Fixed() check
+	rng, err := pgf.PosRange(start, end)
+	if err != nil {
+		return protocol.Location{}, err
+	}
+	return protocol.Location{URI: pgf.URI, Range: rng}, nil
 }
 
 // PosText returns the source text for the token.Pos interval in this file.
@@ -108,7 +207,8 @@ func (pgf *File) PosText(start, end token.Pos) ([]byte, error) {
 
 // NodeRange returns a protocol Range for the ast.Node interval in this file.
 func (pgf *File) NodeRange(node ast.Node) (protocol.Range, error) {
-	return pgf.Mapper.NodeRange(pgf.Tok, node)
+	// PosRange handles Fixed() check
+	return pgf.PosRange(node.Pos(), node.End())
 }
 
 // NodeOffsets returns offsets for the ast.Node.
@@ -118,7 +218,8 @@ func (pgf *File) NodeOffsets(node ast.Node) (start int, end int, _ error) {
 
 // NodeLocation returns a protocol Location for the ast.Node interval in this file.
 func (pgf *File) NodeLocation(node ast.Node) (protocol.Location, error) {
-	return pgf.Mapper.PosLocation(pgf.Tok, node.Pos(), node.End())
+	// PosLocation handles Fixed() check
+	return pgf.PosLocation(node.Pos(), node.End())
 }
 
 // NodeText returns the source text for the ast.Node interval in this file.
@@ -128,6 +229,17 @@ func (pgf *File) NodeText(node ast.Node) ([]byte, error) {
 
 // RangePos parses a protocol Range back into the go/token domain.
 func (pgf *File) RangePos(r protocol.Range) (token.Pos, token.Pos, error) {
+	if pgf.Fixed() {
+		start, err := pgf.PositionPos(r.Start)
+		if err != nil {
+			return token.NoPos, token.NoPos, err
+		}
+		end, err := pgf.PositionPos(r.End)
+		if err != nil {
+			return token.NoPos, token.NoPos, err
+		}
+		return start, end, nil
+	}
 	start, end, err := pgf.Mapper.RangeOffsets(r)
 	if err != nil {
 		return token.NoPos, token.NoPos, err

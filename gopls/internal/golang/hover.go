@@ -214,6 +214,23 @@ func hover(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, rng pr
 	if err != nil {
 		return protocol.Range{}, nil, err
 	}
+
+	// MyGO: If pgf.Src differs from the editor buffer, protocol↔token mappings via
+	// pgf.Mapper are unreliable. In this case, use a best-effort reverse lookup
+	// based on //line-mapped token.Position to find the correct identifier under
+	// the cursor and produce a minimally correct hover.
+	if orig, err := fh.Content(); err == nil && !bytes.Equal(orig, pgf.Src) {
+		if objRng, obj := mygoObjectAtOriginalRange(pkg, pgf, orig, rng); obj != nil {
+			qual := typesinternal.FileQualifier(pgf.File, pkg.Types())
+			h, err := hoverObjectLexical(ctx, snapshot, pkg, pgf, obj, qual)
+			if err != nil {
+				return protocol.Range{}, nil, err
+			}
+			if h != nil {
+				return objRng, h, nil
+			}
+		}
+	}
 	var posRange astutil.Range
 	{
 		start, end, err := pgf.RangePos(rng)
@@ -808,6 +825,254 @@ func hover(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, rng pr
 		promotedFields:    fields,
 		footer:            footer,
 	}, nil
+}
+
+// mygoObjectAtOriginalRange resolves the object under rng using the original
+// editor content (orig), even when pgf.Src has been rewritten (FixSrc).
+//
+// It works by converting rng to an original (line, col8) location, then
+// scanning identifiers in the AST and comparing their //line-mapped positions.
+// It returns the highlight range in original (protocol) coordinates.
+func mygoObjectAtOriginalRange(pkg *cache.Package, pgf *parsego.File, orig []byte, rng protocol.Range) (protocol.Range, types.Object) {
+	origMapper := protocol.NewMapper(pgf.URI, orig)
+	off, err := origMapper.PositionOffset(rng.Start)
+	if err != nil {
+		return protocol.Range{}, nil
+	}
+
+	// Convert byte offset to 1-based (line, col8) in the original buffer.
+	line := 1
+	lineStart := 0
+	for i := 0; i < off && i < len(orig); i++ {
+		if orig[i] == '\n' {
+			line++
+			lineStart = i + 1
+		}
+	}
+	col8 := (off - lineStart) + 1
+	if col8 <= 0 {
+		col8 = 1
+	}
+
+	// Helper to map (line, col8) to a byte offset in orig.
+	offsetAt := func(line, col int) (int, bool) {
+		if line <= 0 || col <= 0 {
+			if line <= 0 {
+				return 0, false
+			}
+			col = 1
+		}
+		ln := 1
+		o := 0
+		for ln < line && o < len(orig) {
+			if orig[o] == '\n' {
+				ln++
+			}
+			o++
+		}
+		if ln != line {
+			return 0, false
+		}
+		o += col - 1
+		if o < 0 {
+			o = 0
+		}
+		if o > len(orig) {
+			o = len(orig)
+		}
+		return o, true
+	}
+
+	uriPath := pgf.URI.Path()
+
+	// Find the best matching identifier on this line whose column span contains col8.
+	var (
+		best     *ast.Ident
+		bestCol  = -1
+		bestLen  = 0
+		bestObj  types.Object
+	)
+
+	// For MyGO files, we need to handle the case where the source has been transformed
+	// (default parameters removed). We scan the original source to find identifiers
+	// that could match the hover position.
+	if isMyGOFile := bytes.Contains(orig, []byte("//mygo:defaultsjson")); isMyGOFile {
+		// Scan the original source line for Go identifiers
+		lineText := extractLine(orig, line)
+		if lineText != "" {
+			// Find all Go identifiers in this line
+			idents := findIdentifiersInLine(lineText)
+			for _, ident := range idents {
+				startCol := ident.start + 1 // 1-based
+				endCol := ident.end + 1     // 1-based
+				if col8 >= startCol && col8 <= endCol {
+					// Find the corresponding AST identifier that matches this name
+					if astIdent := findASTIdentByName(pgf.File, ident.name); astIdent != nil {
+						var obj types.Object
+						if o := pkg.TypesInfo().Uses[astIdent]; o != nil {
+							obj = o
+						} else if o := pkg.TypesInfo().Defs[astIdent]; o != nil {
+							obj = o
+						}
+						if obj != nil {
+							if best == nil || startCol > bestCol {
+								best = astIdent
+								bestCol = startCol
+								bestLen = len(ident.name)
+								bestObj = obj
+							}
+						}
+					}
+				}
+			}
+		}
+	} else {
+		// Original logic for non-MyGO files
+		ast.Inspect(pgf.File, func(n ast.Node) bool {
+			id, ok := n.(*ast.Ident)
+			if !ok || id == nil || id.Name == "_" {
+				return true
+			}
+			// Prefer Uses over Defs.
+			var obj types.Object
+			if o := pkg.TypesInfo().Uses[id]; o != nil {
+				obj = o
+			} else if o := pkg.TypesInfo().Defs[id]; o != nil {
+				obj = o
+			} else {
+				return true
+			}
+
+			posn := safetoken.StartPosition(pkg.FileSet(), id.Pos())
+			if !posn.IsValid() {
+				return true
+			}
+			// Ensure this identifier belongs to the current file. (Allow suffix match
+			// since //line may rewrite filenames in some edge cases.)
+			if posn.Filename != uriPath && !strings.HasSuffix(uriPath, posn.Filename) {
+				return true
+			}
+			if posn.Column <= 0 {
+				posn.Column = 1
+			}
+			if posn.Line != line {
+				return true
+			}
+			start := posn.Column
+			end := start + len(id.Name)
+			if col8 < start || col8 > end {
+				return true
+			}
+			// Choose the tightest match: greatest start column (most specific) wins.
+			if best == nil || start > bestCol {
+				best = id
+				bestCol = start
+				bestLen = len(id.Name)
+				bestObj = obj
+			}
+			return true
+		})
+	}
+
+	if best == nil || bestObj == nil {
+		return protocol.Range{}, nil
+	}
+
+	startOff, ok := offsetAt(line, bestCol)
+	if !ok {
+		return protocol.Range{}, bestObj
+	}
+	endOff := startOff + bestLen
+	if endOff > len(orig) {
+		endOff = len(orig)
+	}
+	hi, err := origMapper.OffsetRange(startOff, endOff)
+	if err != nil {
+		return protocol.Range{}, bestObj
+	}
+	return hi, bestObj
+}
+
+// extractLine extracts the text of the specified line from src (1-based line numbering).
+func extractLine(src []byte, line int) string {
+	if line <= 0 {
+		return ""
+	}
+	currentLine := 1
+	start := 0
+	for i, b := range src {
+		if b == '\n' {
+			if currentLine == line {
+				return string(src[start:i])
+			}
+			currentLine++
+			start = i + 1
+		}
+	}
+	if currentLine == line {
+		return string(src[start:])
+	}
+	return ""
+}
+
+// identInfo holds information about an identifier found in source text.
+type identInfo struct {
+	name  string
+	start int // 0-based byte offset in the line
+	end   int // 0-based byte offset in the line (exclusive)
+}
+
+// findIdentifiersInLine finds all valid Go identifiers in a line of text.
+// Returns identifiers in order from left to right.
+func findIdentifiersInLine(line string) []identInfo {
+	var idents []identInfo
+	i := 0
+	for i < len(line) {
+		// Skip non-identifier characters
+		for i < len(line) && !isGoIdentStart(line[i]) {
+			i++
+		}
+		if i >= len(line) {
+			break
+		}
+		start := i
+		// Consume identifier characters
+		for i < len(line) && isGoIdentChar(line[i]) {
+			i++
+		}
+		if start < i {
+			idents = append(idents, identInfo{
+				name:  line[start:i],
+				start: start,
+				end:   i,
+			})
+		}
+	}
+	return idents
+}
+
+// isGoIdentStart returns true if b can start a Go identifier.
+func isGoIdentStart(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_'
+}
+
+// isGoIdentChar returns true if b can be part of a Go identifier.
+func isGoIdentChar(b byte) bool {
+	return isGoIdentStart(b) || (b >= '0' && b <= '9')
+}
+
+// findASTIdentByName finds an AST identifier with the given name.
+// It returns the first matching identifier found in a depth-first traversal.
+func findASTIdentByName(file *ast.File, name string) *ast.Ident {
+	var found *ast.Ident
+	ast.Inspect(file, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok && id.Name == name {
+			found = id
+			return false // Stop traversal
+		}
+		return true
+	})
+	return found
 }
 
 // mygoDecoratorObjectAt returns the (range, object) for a decorator reference at
