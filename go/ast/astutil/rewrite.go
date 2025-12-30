@@ -286,6 +286,15 @@ func (a *application) apply(parent ast.Node, name string, iter *iterator, n ast.
 		a.apply(n, "Key", nil, n.Key)
 		a.apply(n, "Value", nil, n.Value)
 
+	// --- MyGO extension nodes ---
+	//
+	// MyGO extends go/ast with additional expression nodes (e.g. OptionalChainExpr).
+	// Keep this traversal robust by handling these nodes without a hard dependency
+	// on the extended types, so that this package can still be built with the
+	// standard toolchain.
+	//
+	// NOTE: the cases below are implemented in the default branch using reflection.
+
 	// Types
 	case *ast.ArrayType:
 		a.apply(n, "Len", nil, n.Len)
@@ -429,6 +438,22 @@ func (a *application) apply(parent ast.Node, name string, iter *iterator, n ast.
 		a.apply(n, "Name", nil, n.Name)
 		a.apply(n, "Type", nil, n.Type)
 		a.apply(n, "Body", nil, n.Body)
+		// MyGO: FuncDecl has an extra field:
+		//   Decorator *Ident // decorator name (if any); or nil
+		//
+		// Use reflection so this code remains buildable with the standard toolchain.
+		if rt := reflect.TypeOf(n); rt.Kind() == reflect.Pointer {
+			if _, ok := rt.Elem().FieldByName("Decorator"); ok {
+				rv := reflect.ValueOf(n).Elem().FieldByName("Decorator")
+				var dec ast.Node
+				if rv.IsValid() && !(rv.Kind() == reflect.Pointer && rv.IsNil()) {
+					if dn, ok := rv.Interface().(ast.Node); ok {
+						dec = dn
+					}
+				}
+				a.apply(n, "Decorator", nil, dec)
+			}
+		}
 
 	// Files and packages
 	case *ast.File:
@@ -450,7 +475,63 @@ func (a *application) apply(parent ast.Node, name string, iter *iterator, n ast.
 		}
 
 	default:
-		panic(fmt.Sprintf("Apply: unexpected node type %T", n))
+		// MyGO: handle extension nodes via reflection to avoid panicking when
+		// traversing MyGO AST, while still compiling on the standard toolchain.
+		handled := false
+		switch reflect.TypeOf(n).String() {
+		case "*ast.OptionalChainExpr":
+			// Fields:
+			//   X   Expr
+			//   Sel *Ident
+			rv := reflect.ValueOf(n).Elem()
+			for _, fname := range []string{"X", "Sel"} {
+				fv := rv.FieldByName(fname)
+				var child ast.Node
+				if fv.IsValid() && fv.CanInterface() {
+					if cn, ok := fv.Interface().(ast.Node); ok {
+						child = cn
+					}
+				}
+				a.apply(n, fname, nil, child)
+			}
+			handled = true
+		case "*ast.TernaryExpr":
+			// Fields:
+			//   Cond Expr
+			//   X    Expr
+			//   Y    Expr (may be nil for short form)
+			rv := reflect.ValueOf(n).Elem()
+			for _, fname := range []string{"Cond", "X", "Y"} {
+				fv := rv.FieldByName(fname)
+				var child ast.Node
+				if fv.IsValid() && fv.CanInterface() {
+					if cn, ok := fv.Interface().(ast.Node); ok {
+						child = cn
+					}
+				}
+				a.apply(n, fname, nil, child)
+			}
+			handled = true
+		case "*ast.ElvisExpr":
+			// Fields:
+			//   X Expr
+			//   Y Expr
+			rv := reflect.ValueOf(n).Elem()
+			for _, fname := range []string{"X", "Y"} {
+				fv := rv.FieldByName(fname)
+				var child ast.Node
+				if fv.IsValid() && fv.CanInterface() {
+					if cn, ok := fv.Interface().(ast.Node); ok {
+						child = cn
+					}
+				}
+				a.apply(n, fname, nil, child)
+			}
+			handled = true
+		}
+		if !handled {
+			panic(fmt.Sprintf("Apply: unexpected node type %T", n))
+		}
 	}
 
 	if a.post != nil && !a.post(&a.cursor) {

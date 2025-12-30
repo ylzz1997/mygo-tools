@@ -714,7 +714,8 @@ func (st *state) inlineCall() (*inlineCallResult, error) {
 		// TODO(adonovan): extract this to a function.
 		if sig.Variadic() {
 			lastParam := last(params)
-			if len(args) > 0 && last(args).spread {
+			lastArg := last(args)
+			if len(args) > 0 && lastArg.spread {
 				// spread call to variadic: tricky
 				lastParam.variadic = true
 			} else {
@@ -3129,12 +3130,12 @@ func exists[T any](list []T, f func(i int, x T) bool) bool {
 }
 
 // last returns the last element of a slice, or zero if empty.
-func last[T any](slice []T) T {
+func last[T any](slice []T) (result T) {
 	n := len(slice)
 	if n > 0 {
 		return slice[n-1]
 	}
-	return *new(T)
+	return
 }
 
 // needsParens reports whether parens are required to avoid ambiguity

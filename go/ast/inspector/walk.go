@@ -12,6 +12,7 @@ package inspector
 import (
 	"fmt"
 	"go/ast"
+	"reflect"
 
 	"golang.org/x/tools/go/ast/edge"
 )
@@ -334,7 +335,69 @@ func walk(v *visitor, ek edge.Kind, index int, node ast.Node) {
 
 	default:
 		// (includes *ast.Package)
-		panic(fmt.Sprintf("Walk: unexpected node type %T", n))
+		//
+		// MyGO: handle extension nodes via reflection to avoid panicking when
+		// traversing MyGO AST, while still compiling on the standard toolchain.
+		handled := false
+		switch reflect.TypeOf(n).String() {
+		case "*ast.OptionalChainExpr":
+			// Fields:
+			//   X   Expr
+			//   Sel *Ident
+			rv := reflect.ValueOf(n).Elem()
+			for _, fname := range []string{"X", "Sel"} {
+				fv := rv.FieldByName(fname)
+				if !fv.IsValid() || !fv.CanInterface() {
+					continue
+				}
+				child, _ := fv.Interface().(ast.Node) // may be nil
+				if child != nil {
+					// No stable edge.Kind for extension nodes: use Invalid.
+					walk(v, edge.Invalid, -1, child)
+				}
+			}
+			handled = true
+
+		case "*ast.TernaryExpr":
+			// Fields:
+			//   Cond Expr
+			//   X    Expr
+			//   Y    Expr (may be nil for short form)
+			rv := reflect.ValueOf(n).Elem()
+			for _, fname := range []string{"Cond", "X", "Y"} {
+				fv := rv.FieldByName(fname)
+				if !fv.IsValid() || !fv.CanInterface() {
+					continue
+				}
+				child, _ := fv.Interface().(ast.Node) // may be nil
+				if child != nil {
+					// No stable edge.Kind for extension nodes: use Invalid.
+					walk(v, edge.Invalid, -1, child)
+				}
+			}
+			handled = true
+
+		case "*ast.ElvisExpr":
+			// Fields:
+			//   X Expr
+			//   Y Expr
+			rv := reflect.ValueOf(n).Elem()
+			for _, fname := range []string{"X", "Y"} {
+				fv := rv.FieldByName(fname)
+				if !fv.IsValid() || !fv.CanInterface() {
+					continue
+				}
+				child, _ := fv.Interface().(ast.Node) // may be nil
+				if child != nil {
+					// No stable edge.Kind for extension nodes: use Invalid.
+					walk(v, edge.Invalid, -1, child)
+				}
+			}
+			handled = true
+		}
+		if !handled {
+			panic(fmt.Sprintf("Walk: unexpected node type %T", n))
+		}
 	}
 
 	v.pop(node)

@@ -169,7 +169,20 @@ func (s *server) diagnoseChangedViews(ctx context.Context, modID uint64, lastCha
 		}(snapshot, uris)
 	}
 
-	wg.Wait()
+	// Don't block forever waiting for diagnostics if this diagnosis context has
+	// been superseded (e.g. by subsequent edits) or cancelled. In that case, the
+	// underlying diagnoseSnapshot work should observe ctx and return; but even if
+	// it doesn't, we must avoid piling up stuck diagnoseChangedViews goroutines.
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return
+	}
 
 	// Diagnose orphaned files for the session.
 	orphanedFileDiagnostics, err := s.session.OrphanedFileDiagnostics(ctx)
