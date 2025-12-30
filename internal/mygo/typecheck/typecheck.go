@@ -34,6 +34,24 @@ import (
 	"golang.org/x/tools/internal/typesinternal"
 )
 
+// NOTE(MyGO):
+// Historically, this package implemented a 2-phase rewrite because the upstream
+// go/types did not understand MyGO-only AST nodes (*ast.OptionalChainExpr,
+// *ast.TernaryExpr, *ast.ElvisExpr).
+//
+// In this repo, the MyGO toolchain's go/types has been taught to type-check
+// these nodes directly. Keeping the legacy placeholder/expansion pipeline
+// enabled causes incorrect diagnostics for code like:
+//
+//   user?.Profile?.Email != nil
+//
+// because placeholders temporarily erase the optional-chain semantics and turn
+// it into "user.Profile.Email != nil" (string != nil).
+//
+// Therefore, we disable the legacy rewrite pipeline. Standard Go toolchains
+// won't produce these AST nodes anyway, so this is safe.
+const enableLegacyRewrite = false
+
 func isOptionalChainExpr(n ast.Node) bool {
 	if n == nil {
 		return false
@@ -58,6 +76,9 @@ func isElvisExpr(n ast.Node) bool {
 // NeedsRewrite reports whether file contains any MyGO-only AST nodes that
 // require rewriting before go/types can type-check it.
 func NeedsRewrite(file *ast.File) bool {
+	if !enableLegacyRewrite {
+		return false
+	}
 	need := false
 	ast.Inspect(file, func(n ast.Node) bool {
 		if isOptionalChainExpr(n) || isTernaryExpr(n) || isElvisExpr(n) {
@@ -571,6 +592,9 @@ func expandPlaceholders(file *ast.File, ph *placeholders, info *types.Info, pkg 
 // - performing the temporary typecheck that populates tmpInfo,
 // - running the final typecheck after rewrite.
 func RewriteInPlace(files []*ast.File, tmpInfo *types.Info, tmpPkg *types.Package) {
+	if !enableLegacyRewrite {
+		return
+	}
 	phs := make([]*placeholders, 0, len(files))
 	for _, f := range files {
 		phs = append(phs, preparePlaceholders(f))

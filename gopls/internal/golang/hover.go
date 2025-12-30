@@ -867,7 +867,7 @@ func mygoHoverExtras(declPkg *cache.Package, declPGF *parsego.File, decl ast.Dec
 	if fn, _ := obj.(*types.Func); fn != nil {
 		if di, ok := objIdx[fn]; ok && len(di.Names) == len(di.Exprs) && len(di.Names) > 0 {
 			var b strings.Builder
-			b.WriteString("MyGO 默认参数: ")
+			b.WriteString("Default Parameter Value: ")
 			for i := range di.Names {
 				if i > 0 {
 					b.WriteString(", ")
@@ -884,7 +884,7 @@ func mygoHoverExtras(declPkg *cache.Package, declPGF *parsego.File, decl ast.Dec
 		if sig := fn.Signature(); sig != nil && sig.Recv() != nil {
 			if base, ok := mygoBaseMethodName(fn.Name()); ok {
 				if cands := mygoOverloadCandidateNames(sig.Recv().Type(), fn.Pkg(), base); len(cands) > 1 {
-					parts = append(parts, "MyGO 方法重载候选: "+strings.Join(cands, ", "))
+					parts = append(parts, "Method Overloading Candidates: "+strings.Join(cands, ", "))
 				}
 			}
 		}
@@ -896,7 +896,7 @@ func mygoHoverExtras(declPkg *cache.Package, declPGF *parsego.File, decl ast.Dec
 			if fnObj, _ := declPkg.TypesInfo().Defs[fd.Name].(*types.Func); fnObj != nil {
 				if di, ok := objIdx[fnObj]; ok && len(di.Names) == len(di.Exprs) && len(di.Names) > 0 {
 					if expr, ok := mygoDefaultExprForParam(di, v.Name()); ok {
-						parts = append(parts, "MyGO 默认值: "+v.Name()+"="+expr)
+						parts = append(parts, "Default Parameter Value: "+v.Name()+"="+expr)
 					}
 				}
 			}
