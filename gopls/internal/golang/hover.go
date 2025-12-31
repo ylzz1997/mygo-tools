@@ -884,7 +884,18 @@ func mygoHoverExtras(declPkg *cache.Package, declPGF *parsego.File, decl ast.Dec
 		if sig := fn.Signature(); sig != nil && sig.Recv() != nil {
 			if base, ok := mygoBaseMethodName(fn.Name()); ok {
 				if cands := mygoOverloadCandidateNames(sig.Recv().Type(), fn.Pkg(), base); len(cands) > 1 {
-					parts = append(parts, "Method Overloading Candidates: \n"+strings.Join(cands, "\n"))
+					candSet := make(map[string]bool)
+					for _, cand := range cands {
+						candSet[mygoMethodNameWithParams(cand)] = true
+					}
+					// Also add the current method's formatted name
+					candSet[mygoMethodNameWithParams(fn.Name())] = true
+					var candNames []string
+					for name := range candSet {
+						candNames = append(candNames, name)
+					}
+					sort.Strings(candNames)
+					parts = append(parts, "Method Overloading Candidates: "+strings.Join(candNames, ", "))
 				}
 			}
 		}
@@ -1073,6 +1084,38 @@ func mygoBaseMethodName(current string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// mygoMethodNameWithParams formats a method name as "baseName(paramTypes)".
+// For example: "_Add_int" => "Add(int)", "_Add_int_string" => "Add(int, string)"
+func mygoMethodNameWithParams(methodName string) string {
+	base, ok := mygoBaseMethodName(methodName)
+	if !ok {
+		return methodName
+	}
+
+	// Extract parameter part by removing the prefix and base name
+	// Use the same logic as mygoOverloadCandidateNames to determine the prefix
+	var pfx string
+	baseWithUnderscore := "_" + base
+	if mygomagic.IsSingleUnderscoreMagic(baseWithUnderscore) {
+		pfx = baseWithUnderscore + "_"
+	} else {
+		pfx = "_" + base + "_"
+	}
+
+	// Extract parameter part after the prefix
+	if !strings.HasPrefix(methodName, pfx) {
+		return base
+	}
+	paramPart := strings.TrimPrefix(methodName, pfx)
+	if paramPart == "" {
+		return base
+	}
+
+	// Replace underscores with ", " for parameter separation
+	params := strings.ReplaceAll(paramPart, "_", ", ")
+	return base + "(" + params + ")"
 }
 
 func mygoOverloadCandidateNames(recvT types.Type, pkg *types.Package, base string) []string {
