@@ -883,7 +883,6 @@ func mygoHoverExtras(declPkg *cache.Package, declPGF *parsego.File, decl ast.Dec
 		// method looks like a renamed overload).
 		if sig := fn.Signature(); sig != nil && sig.Recv() != nil {
 			if base, ok := mygoBaseMethodName(fn.Name()); ok {
-				fmt.Println("base", base)
 				if cands := mygoOverloadCandidateNames(sig.Recv().Type(), fn.Pkg(), base); len(cands) > 1 {
 					parts = append(parts, "Method Overloading Candidates: \n"+strings.Join(cands, "\n"))
 				}
