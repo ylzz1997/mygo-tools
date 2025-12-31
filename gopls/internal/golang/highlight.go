@@ -5,6 +5,7 @@
 package golang
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"go/ast"
@@ -38,9 +39,9 @@ func Highlight(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, po
 	// MyGO: If pgf.Src differs from the editor buffer, protocol↔token mappings via
 	// pgf.Mapper are unreliable (FixSrc rewrite). In this case, compute highlights
 	// using the original editor buffer and //line-mapped token positions.
-	// if orig, err := fh.Content(); err == nil && !bytes.Equal(orig, pgf.Src) {
-	// 	return mygoHighlightOriginal(pkg, pgf, orig, position)
-	// }
+	if orig, err := fh.Content(); err == nil && !bytes.Equal(orig, pgf.Src) {
+		return mygoHighlightOriginal(pkg, pgf, orig, position)
+	}
 
 	pos, err := pgf.PositionPos(position)
 	if err != nil {
@@ -72,6 +73,32 @@ func Highlight(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, po
 		if err != nil {
 			return nil, err
 		}
+
+		// MyGO: If AST identifier length (e.g. mangled name) exceeds source length,
+		// truncate the highlight range to the source identifier length.
+		// This happens when the parser produces mangled names (for overloading)
+		// but the source text (pgf.Src) remains original.
+		if kind == protocol.Text || kind == protocol.Read || kind == protocol.Write {
+			startOff, endOff, err := pgf.Mapper.RangeOffsets(rng)
+			if err == nil && endOff > startOff && startOff < len(pgf.Src) {
+				// Check if it starts as an identifier
+				if isGoIdentStart(pgf.Src[startOff]) {
+					// Scan the actual length in source
+					realEnd := startOff + 1
+					for realEnd < len(pgf.Src) && isGoIdentChar(pgf.Src[realEnd]) {
+						realEnd++
+					}
+					// If the source identifier is shorter than the AST range, truncate it.
+					if realEnd < endOff {
+						newEnd, err := pgf.Mapper.OffsetPosition(realEnd)
+						if err == nil {
+							rng.End = newEnd
+						}
+					}
+				}
+			}
+		}
+
 		ranges = append(ranges, protocol.DocumentHighlight{
 			Range: rng,
 			Kind:  kind,
