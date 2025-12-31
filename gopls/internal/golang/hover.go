@@ -883,8 +883,9 @@ func mygoHoverExtras(declPkg *cache.Package, declPGF *parsego.File, decl ast.Dec
 		// method looks like a renamed overload).
 		if sig := fn.Signature(); sig != nil && sig.Recv() != nil {
 			if base, ok := mygoBaseMethodName(fn.Name()); ok {
+				fmt.Println("base", base)
 				if cands := mygoOverloadCandidateNames(sig.Recv().Type(), fn.Pkg(), base); len(cands) > 1 {
-					parts = append(parts, "Method Overloading Candidates: "+strings.Join(cands, ", "))
+					parts = append(parts, "Method Overloading Candidates: \n"+strings.Join(cands, "\n"))
 				}
 			}
 		}
@@ -1156,33 +1157,51 @@ func mygoObjectAtOriginalRange(pkg *cache.Package, pgf *parsego.File, orig []byt
 		col8 = 1
 	}
 
-	// Helper to map (line, col8) to a byte offset in orig.
-	offsetAt := func(line, col int) (int, bool) {
-		if line <= 0 || col <= 0 {
-			if line <= 0 {
-				return 0, false
+	// Determine highlight range purely from the original editor buffer.
+	// This avoids accidentally highlighting the length of MyGO-mangled identifiers
+	// (e.g. "_Add_float64_float64") when the user actually wrote "Add".
+	lineText := extractLine(orig, line)
+	var (
+		hiStartOff = -1
+		hiEndOff   = -1
+	)
+	if lineText != "" {
+		idents := findIdentifiersInLine(lineText)
+		var picked *identInfo
+		for i := range idents {
+			ident := idents[i]
+			startCol := ident.start + 1 // 1-based
+			endCol := ident.end + 1     // 1-based, inclusive end for col check
+			if col8 >= startCol && col8 <= endCol {
+				picked = &idents[i]
+				break
 			}
-			col = 1
 		}
-		ln := 1
-		o := 0
-		for ln < line && o < len(orig) {
-			if orig[o] == '\n' {
-				ln++
+		// If the cursor is on the '.' of a selector (or otherwise not inside the
+		// identifier), try the identifier immediately to the right.
+		if picked == nil {
+			for i := range idents {
+				ident := idents[i]
+				startCol := ident.start + 1
+				if startCol == col8+1 {
+					picked = &idents[i]
+					break
+				}
 			}
-			o++
 		}
-		if ln != line {
-			return 0, false
+		if picked != nil {
+			hiStartOff = lineStart + picked.start
+			hiEndOff = lineStart + picked.end
+			if hiStartOff < 0 {
+				hiStartOff = 0
+			}
+			if hiEndOff < hiStartOff {
+				hiEndOff = hiStartOff
+			}
+			if hiEndOff > len(orig) {
+				hiEndOff = len(orig)
+			}
 		}
-		o += col - 1
-		if o < 0 {
-			o = 0
-		}
-		if o > len(orig) {
-			o = len(orig)
-		}
-		return o, true
 	}
 
 	uriPath := pgf.URI.Path()
@@ -1195,103 +1214,91 @@ func mygoObjectAtOriginalRange(pkg *cache.Package, pgf *parsego.File, orig []byt
 		bestObj types.Object
 	)
 
-	// For MyGO files, we need to handle the case where the source has been transformed
-	// (default parameters removed). We scan the original source to find identifiers
-	// that could match the hover position.
-	//
-	// Note: orig is the *editor* buffer (pre-FixSrc), so it will not contain the
-	// injected metadata markers. Detect MyGO defaults by checking the parsed AST
-	// for injected metadata.
-	if isMyGOFile := mygodefaults.HasAnyMetadata([]*ast.File{pgf.File}); isMyGOFile {
-		// Scan the original source line for Go identifiers
-		lineText := extractLine(orig, line)
+	ast.Inspect(pgf.File, func(n ast.Node) bool {
+		id, ok := n.(*ast.Ident)
+		if !ok || id == nil || id.Name == "_" {
+			return true
+		}
+		// Prefer Uses over Defs.
+		var obj types.Object
+		if o := pkg.TypesInfo().Uses[id]; o != nil {
+			obj = o
+		} else if o := pkg.TypesInfo().Defs[id]; o != nil {
+			obj = o
+		} else {
+			return true
+		}
+
+		posn := safetoken.StartPosition(pkg.FileSet(), id.Pos())
+		if !posn.IsValid() {
+			return true
+		}
+		// Ensure this identifier belongs to the current file. (Allow suffix match
+		// since //line may rewrite filenames in some edge cases.)
+		if posn.Filename != uriPath && !strings.HasSuffix(uriPath, posn.Filename) {
+			return true
+		}
+		if posn.Column <= 0 {
+			posn.Column = 1
+		}
+		if posn.Line != line {
+			return true
+		}
+
+		// Adjust length based on original source if possible.
+		// The AST identifier name might differ (e.g. MyGO mangled name), so we use
+		// the length of the identifier as it appears in the editor buffer.
+		realLen := len(id.Name)
 		if lineText != "" {
-			// Find all Go identifiers in this line
-			idents := findIdentifiersInLine(lineText)
-			for _, ident := range idents {
-				startCol := ident.start + 1 // 1-based
-				endCol := ident.end + 1     // 1-based
-				if col8 >= startCol && col8 <= endCol {
-					// Find the corresponding AST identifier that matches this name
-					if astIdent := findASTIdentByName(pgf.File, ident.name); astIdent != nil {
-						var obj types.Object
-						if o := pkg.TypesInfo().Uses[astIdent]; o != nil {
-							obj = o
-						} else if o := pkg.TypesInfo().Defs[astIdent]; o != nil {
-							obj = o
+			startIdx := posn.Column - 1
+			if startIdx >= 0 && startIdx < len(lineText) {
+				if isGoIdentStart(lineText[startIdx]) {
+					l := 1
+					for i := startIdx + 1; i < len(lineText); i++ {
+						if !isGoIdentChar(lineText[i]) {
+							break
 						}
-						if obj != nil {
-							if best == nil || startCol > bestCol {
-								best = astIdent
-								bestCol = startCol
-								bestLen = len(ident.name)
-								bestObj = obj
-							}
-						}
+						l++
 					}
+					realLen = l
 				}
 			}
 		}
-	} else {
-		// Original logic for non-MyGO files
-		ast.Inspect(pgf.File, func(n ast.Node) bool {
-			id, ok := n.(*ast.Ident)
-			if !ok || id == nil || id.Name == "_" {
-				return true
-			}
-			// Prefer Uses over Defs.
-			var obj types.Object
-			if o := pkg.TypesInfo().Uses[id]; o != nil {
-				obj = o
-			} else if o := pkg.TypesInfo().Defs[id]; o != nil {
-				obj = o
-			} else {
-				return true
-			}
 
-			posn := safetoken.StartPosition(pkg.FileSet(), id.Pos())
-			if !posn.IsValid() {
-				return true
-			}
-			// Ensure this identifier belongs to the current file. (Allow suffix match
-			// since //line may rewrite filenames in some edge cases.)
-			if posn.Filename != uriPath && !strings.HasSuffix(uriPath, posn.Filename) {
-				return true
-			}
-			if posn.Column <= 0 {
-				posn.Column = 1
-			}
-			if posn.Line != line {
-				return true
-			}
-			start := posn.Column
-			end := start + len(id.Name)
-			if col8 < start || col8 > end {
-				return true
-			}
-			// Choose the tightest match: greatest start column (most specific) wins.
-			if best == nil || start > bestCol {
-				best = id
-				bestCol = start
-				bestLen = len(id.Name)
-				bestObj = obj
-			}
+		start := posn.Column
+		end := start + realLen
+		if col8 < start || col8 > end {
 			return true
-		})
-	}
+		}
+		// Choose the tightest match: greatest start column (most specific) wins.
+		if best == nil || start > bestCol {
+			best = id
+			bestCol = start
+			bestLen = realLen
+			bestObj = obj
+		}
+		return true
+	})
 
 	if best == nil || bestObj == nil {
 		return protocol.Range{}, nil
 	}
 
-	startOff, ok := offsetAt(line, bestCol)
-	if !ok {
-		return protocol.Range{}, bestObj
+	// Prefer the highlight range computed from the original buffer. Fall back to
+	// bestCol/bestLen if we couldn't determine it.
+	startOff := hiStartOff
+	endOff := hiEndOff
+	if startOff < 0 || endOff < 0 || startOff > endOff {
+		startOff = lineStart + (bestCol - 1)
+		if startOff < 0 {
+			startOff = 0
+		}
+		endOff = startOff + bestLen
+		if endOff > len(orig) {
+			endOff = len(orig)
+		}
 	}
-	endOff := startOff + bestLen
-	if endOff > len(orig) {
-		endOff = len(orig)
-	}
+
 	hi, err := origMapper.OffsetRange(startOff, endOff)
 	if err != nil {
 		return protocol.Range{}, bestObj
@@ -1472,6 +1479,11 @@ func hoverObjectLexical(ctx context.Context, snapshot *cache.Snapshot, originPkg
 	}
 
 	signature := types.ObjectString(obj, qual)
+	if fn, ok := obj.(*types.Func); ok {
+		if base, ok := mygoBaseMethodName(fn.Name()); ok {
+			signature = strings.Replace(signature, fn.Name(), base, 1)
+		}
+	}
 	// For some objects (notably aliases / type names), objectString provides a
 	// better signature, but it requires AST context. Fall back to types.ObjectString
 	// which is always safe for lexically resolved objects.
@@ -2092,7 +2104,11 @@ func objectString(obj types.Object, qual types.Qualifier, declPos token.Pos, fil
 			buf.WriteString(s)
 			buf.WriteString(".")
 		}
-		buf.WriteString(obj.Name())
+		name := obj.Name()
+		if base, ok := mygoBaseMethodName(name); ok {
+			name = base
+		}
+		buf.WriteString(name)
 		types.WriteSignature(&buf, sig, qual)
 		str = buf.String()
 

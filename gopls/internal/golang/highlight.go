@@ -15,8 +15,10 @@ import (
 
 	goastutil "golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/gopls/internal/cache"
+	"golang.org/x/tools/gopls/internal/cache/parsego"
 	"golang.org/x/tools/gopls/internal/file"
 	"golang.org/x/tools/gopls/internal/protocol"
+	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/astutil"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/fmtstr"
@@ -32,6 +34,13 @@ func Highlight(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, po
 	if err != nil {
 		return nil, fmt.Errorf("getting package for Highlight: %w", err)
 	}
+
+	// MyGO: If pgf.Src differs from the editor buffer, protocol↔token mappings via
+	// pgf.Mapper are unreliable (FixSrc rewrite). In this case, compute highlights
+	// using the original editor buffer and //line-mapped token positions.
+	// if orig, err := fh.Content(); err == nil && !bytes.Equal(orig, pgf.Src) {
+	// 	return mygoHighlightOriginal(pkg, pgf, orig, position)
+	// }
 
 	pos, err := pgf.PositionPos(position)
 	if err != nil {
@@ -65,6 +74,179 @@ func Highlight(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, po
 		}
 		ranges = append(ranges, protocol.DocumentHighlight{
 			Range: rng,
+			Kind:  kind,
+		})
+	}
+	return ranges, nil
+}
+
+// mygoHighlightOriginal computes document highlights using the original editor
+// buffer (orig). This avoids incorrect highlight ranges when pgf.Src has been
+// rewritten by FixSrc (e.g. due to MyGO default parameters or overload name
+// mangling).
+func mygoHighlightOriginal(pkg *cache.Package, pgf *parsego.File, orig []byte, position protocol.Position) ([]protocol.DocumentHighlight, error) {
+	origMapper := protocol.NewMapper(pgf.URI, orig)
+	off, err := origMapper.PositionOffset(position)
+	if err != nil {
+		return nil, err
+	}
+	if off < 0 || off > len(orig) {
+		return nil, nil
+	}
+
+	// Convert byte offset to 1-based (line, col8) in the original buffer.
+	line := 1
+	lineStart := 0
+	for i := 0; i < off && i < len(orig); i++ {
+		if orig[i] == '\n' {
+			line++
+			lineStart = i + 1
+		}
+	}
+	col8 := (off - lineStart) + 1
+	if col8 <= 0 {
+		col8 = 1
+	}
+
+	lineText := extractLine(orig, line)
+	if lineText == "" {
+		return nil, nil
+	}
+
+	// Find the identifier under (or just after) the cursor in the original buffer.
+	idents := findIdentifiersInLine(lineText)
+	var picked *identInfo
+	for i := range idents {
+		ident := idents[i]
+		startCol := ident.start + 1 // 1-based
+		endCol := ident.end + 1     // inclusive for col check
+		if col8 >= startCol && col8 <= endCol {
+			picked = &idents[i]
+			break
+		}
+	}
+	// If the cursor is on '.' of a selector (or otherwise not inside an ident),
+	// try the identifier immediately to the right.
+	if picked == nil {
+		for i := range idents {
+			ident := idents[i]
+			startCol := ident.start + 1
+			if startCol == col8+1 {
+				picked = &idents[i]
+				break
+			}
+		}
+	}
+	if picked == nil {
+		return nil, nil
+	}
+	startCol := picked.start + 1
+
+	// Resolve the corresponding AST ident by matching //line-mapped (line, col).
+	uriPath := pgf.URI.Path()
+	var sel *ast.Ident
+	ast.Inspect(pgf.File, func(n ast.Node) bool {
+		id, ok := n.(*ast.Ident)
+		if !ok || id == nil || id.Name == "_" {
+			return true
+		}
+		posn := safetoken.StartPosition(pkg.FileSet(), id.Pos())
+		if !posn.IsValid() {
+			return true
+		}
+		if posn.Filename != uriPath && !strings.HasSuffix(uriPath, posn.Filename) {
+			return true
+		}
+		if posn.Line != line {
+			return true
+		}
+		if posn.Column <= 0 {
+			posn.Column = 1
+		}
+		if posn.Column == startCol {
+			sel = id
+			return false
+		}
+		return true
+	})
+	if sel == nil {
+		return nil, nil
+	}
+
+	// Compute semantic highlights for the identifier's object.
+	result := make(map[astutil.Range]protocol.DocumentHighlightKind)
+	highlightIdentifier(sel, pgf.File, pkg.TypesInfo(), result)
+
+	// Convert token ranges to protocol ranges using the original buffer.
+	// For identifier-like ranges, compute the end offset by scanning the original
+	// buffer to avoid mangled-name lengths.
+	offsetAt := func(line, col int) (int, bool) {
+		if line <= 0 {
+			return 0, false
+		}
+		if col <= 0 {
+			col = 1
+		}
+		ln := 1
+		o := 0
+		for ln < line && o < len(orig) {
+			if orig[o] == '\n' {
+				ln++
+			}
+			o++
+		}
+		if ln != line {
+			return 0, false
+		}
+		o += col - 1
+		if o < 0 {
+			o = 0
+		}
+		if o > len(orig) {
+			o = len(orig)
+		}
+		return o, true
+	}
+
+	var ranges []protocol.DocumentHighlight
+	for rng, kind := range result {
+		sp := safetoken.StartPosition(pkg.FileSet(), rng.Pos())
+		ep := safetoken.EndPosition(pkg.FileSet(), rng.End())
+		if !sp.IsValid() || !ep.IsValid() {
+			continue
+		}
+		if sp.Filename != uriPath && !strings.HasSuffix(uriPath, sp.Filename) {
+			continue
+		}
+		startOff, ok := offsetAt(sp.Line, sp.Column)
+		if !ok {
+			continue
+		}
+		endOff, ok := offsetAt(ep.Line, ep.Column)
+		if !ok {
+			// Best-effort: keep at least one byte.
+			endOff = startOff
+		}
+		if startOff < len(orig) && isGoIdentStart(orig[startOff]) {
+			// Override end offset to the identifier length in the original buffer.
+			i := startOff + 1
+			for i < len(orig) && isGoIdentChar(orig[i]) {
+				i++
+			}
+			endOff = i
+		}
+		if endOff < startOff {
+			endOff = startOff
+		}
+		if endOff > len(orig) {
+			endOff = len(orig)
+		}
+		pr, err := origMapper.OffsetRange(startOff, endOff)
+		if err != nil {
+			continue
+		}
+		ranges = append(ranges, protocol.DocumentHighlight{
+			Range: pr,
 			Kind:  kind,
 		})
 	}
